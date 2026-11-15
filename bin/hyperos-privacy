@@ -1,0 +1,1232 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""Audit and apply HyperOS privacy cleanup and HyperCeiler protection over ADB + Root."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime
+import json
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+
+DISABLED_PACKAGES: tuple[str, ...] = (
+    # Subsystem 1: Antivirus / Anti-Fraud scanning engine
+    "com.miui.guardprovider",
+    # Subsystem 2: Carrier & SoC telemetry, logging, traffic redirection, NLP sniffing, and ad services
+    "com.mobiletools.systemhelper",
+    "com.miui.wmsvc",
+    "com.xiaomi.metoknlp",
+    "com.guji.loveparty",
+    "com.qualcomm.qti.devicestatisticsservice",
+    "com.qti.qcc",
+    "com.debug.loggerui",
+    "com.mediatek.mdmlsample",
+    "com.miui.analytics",
+    "com.xiaomi.security.onetrack",
+    "com.miui.daemon",
+    "com.miui.systemAdSolution",
+    "com.miui.misightservice",
+    "com.bsp.catchlog",
+    "com.miui.bugreport",
+    "com.miui.uireporter",
+    "com.xiaomi.ab",
+    "com.xiaomi.registration",
+    "com.miui.powerinsight",
+    "com.miui.thirdappassistant",
+    "com.xiaomi.mtb",
+    "com.xiaomi.otrpbroker",
+    "com.xiaomi.ugd",
+    "com.miui.miservice",
+    # Subsystem 3: Cloud control, screen/content catchers, AdServices, family guard, and quick-app/feeds
+    "com.xiaomi.joyose",
+    "com.miui.cleanmaster",
+    "com.miui.contentcatcher",
+    "com.miui.contentextension",
+    "com.xiaomi.aicr",
+    "com.xiaomi.aiasst.vision",
+    "com.xiaomi.aiasst.service",
+    "com.miui.greenguard",
+    "com.android.adservices.api",
+    "com.android.ondevicepersonalization.services",
+    "com.android.federatedcompute.services",
+    "com.miui.hybrid",
+    "com.miui.newhome",
+    "com.xiaomi.vipaccount",
+    "com.xiaomi.gamecenter",
+    "com.xiaomi.gamecenter.sdk.service",
+    "com.xiaomi.migameservice",
+    "com.xiaomi.minigame",
+    "com.miui.yellowpage",
+    "com.miui.virtualsim",
+    "com.miui.vsimcore",
+    # Subsystem 4: Unused preinstalled Chinese OEM IMEs (Fcitx5 + DashVoice + Gboard preserved)
+    "com.sohu.inputmethod.sogou.xiaomi",
+    "com.baidu.input_mi",
+    "com.iflytek.inputmethod.miui",
+    "com.iflytek.inputmethod",
+)
+
+SECURITYCENTER_DISABLED_COMPONENTS: tuple[str, ...] = (
+    "com.miui.securitycenter/com.miui.antivirus.service.GuardService",
+    "com.miui.securitycenter/com.miui.antivirus.service.DialogService",
+    "com.miui.securitycenter/com.miui.antivirus.receiver.UpdaterReceiver",
+    "com.miui.securitycenter/com.miui.antifraud.AntiFraudReceiver",
+    "com.miui.securitycenter/com.miui.riskapp.EnhancedConfirmationDialogActivity",
+    "com.miui.securitycenter/com.miui.riskcontrol.SensitiveWordDetectProvider",
+    "com.miui.securitycenter/com.miui.securityscan.cards.DownloadInstallReceiver",
+    "com.miui.securitycenter/com.miui.ai.service.OperationListCollectService",
+    "com.miui.securitycenter/com.miui.securityscan.fileobserver.ImageProtectService",
+    "com.miui.securitycenter/com.miui.apppredict.service.AppPredictService",
+)
+
+# Disabling JobService components causes JobScheduler.schedule() to throw IllegalArgumentException
+# on SecurityCenter startup, triggering HyperCeiler CrashMonitor Safe Mode lock.
+SECURITYCENTER_REQUIRED_JOB_COMPONENTS: tuple[str, ...] = (
+    "com.miui.securitycenter/com.miui.antivirus.service.ScanJobService",
+    "com.miui.securitycenter/com.miui.antivirus.service.VirusAutoUpdateJobService",
+    "com.miui.securitycenter/com.miui.securityscan.job.DataUploaderJobService",
+    "com.miui.securitycenter/com.miui.securityscan.job.CloudSyncJobService",
+)
+
+DAEMON_DISABLED_COMPONENTS: tuple[str, ...] = (
+    "com.miui.daemon/com.miui.daemon.mqsas.OmniTestReceiver",
+    "com.miui.daemon/com.miui.daemon.mqsas.providers.MQSProvider",
+    "com.miui.daemon/com.miui.thirdappassistant.ExceptionDataProvider",
+    "com.miui.daemon/com.miui.daemon.performance.BugReportReceiver",
+    "com.miui.daemon/com.miui.daemon.performance.provider.PerfTurboProvider",
+    "com.miui.daemon/com.miui.daemon.performance.SysoptService",
+    "com.miui.daemon/com.miui.daemon.performance.MiuiPerfService",
+)
+
+PACKAGEINSTALLER_DISABLED_COMPONENTS: tuple[str, ...] = (
+    "com.miui.packageinstaller/com.xiaomi.milogsdk.PushUploadLogReceiver",
+    "com.miui.packageinstaller/com.android.packageinstaller.AppActiveReceiver",
+)
+
+XMSF_DISABLED_COMPONENTS: tuple[str, ...] = (
+    "com.xiaomi.xmsf/com.xiaomi.xmsf.eventtracking.PrivacyReportService",
+    "com.xiaomi.xmsf/com.xiaomi.milogsdk.PushUploadLogReceiver",
+    "com.xiaomi.xmsf/com.xiaomi.xmsf.push.service.receivers.XMSFUploadReceiver",
+    "com.xiaomi.xmsf/com.xiaomi.xms.prefetch.PackageMonitorReceiver",
+    "com.xiaomi.xmsf/com.xiaomi.xmsf.mimobile.PackageInstalledReceiver",
+)
+XMSF_OPTIONAL_DISABLED_COMPONENTS: tuple[str, ...] = (
+    "com.xiaomi.xmsf/com.xiaomi.push.service.UploadLogSDKService",
+)
+
+SENSITIVE_LOG_REGEX = (
+    r"nagram|telegram|torproject|follow\.clash|kr328\.clash|bettbox|twitter\.android|"
+    r"nthlink|seagull|barcelona|t66y|lantern|psiphon|picacomic|copymanga|protonmail|"
+    r"sslcapture|kernelsu|lsposed|hyperceiler|hma_oss|fakeloc|gogogo|shizuku"
+)
+
+HMA_HIDE_ROOT_LIST: tuple[str, ...] = (
+    "me.weishu.kernelsu",
+    "org.lsposed.manager",
+    "com.sevtinge.hyperceiler",
+    "org.frknkrc44.hma_oss",
+    "moe.shizuku.privileged.api",
+    "com.rosan.installer.x",
+    "com.modify.installer",
+    "com.byyoung.setting",
+    "com.byyoung.miuisetting",
+    "com.byyoung.extract",
+    "gr.nikolasspyr.integritycheck",
+    "com.zcshou.gogogo",
+    "io.github.auag0.hidemocklocation",
+    "com.lerist.fakelocation",
+    "io.github.cobylinweiqi.fakeloc",
+    "app.greyshirts.sslcapture",
+    "bin.mt.plus",
+    "bin.mt.termex",
+    "com.edwardgreve.ipakeyboard",
+)
+
+HMA_HIDE_SENSITIVE_LIST: tuple[str, ...] = (
+    "com.follow.clash",
+    "com.appshub.bettbox",
+    "com.github.kr328.clash",
+    "org.torproject.torbrowser",
+    "com.nthlink.android.client",
+    "tool.seagull.v",
+    "com.psiphon3",
+    "org.getlantern.lantern",
+    "com.duckduckgo.mobile.android",
+    "com.saily.android",
+    "im.angry.easyeuicc",
+    "xyz.nextalone.nagram",
+    "org.telegram.messenger",
+    "com.twitter.android",
+    "com.instagram.barcelona",
+    "com.instagram.android",
+    "com.discord",
+    "com.reddit.frontpage",
+    "com.openai.chatgpt",
+    "com.google.android.apps.bard",
+    "ch.protonmail.android",
+    "com.cl.newt66y",
+    "com.picacomic.fregata",
+    "com.copymanga.app",
+    "com.maou.community",
+    "com.okinc.okex.gp",
+    "com.google.android.youtube",
+    "org.fdroid.fdroid",
+    "com.apkmirror.helper.prod",
+    "com.apkpure.aegon",
+)
+
+DOMESTIC_SCOPED_APPS: tuple[str, ...] = (
+    "cn.gov.tax.its",
+    "com.gov.cn",
+    "cn.com.chsi.chsiapp",
+    "cn.com.bmac.nfc",
+    "com.MobileTicket",
+    "com.chinamworld.main",
+    "com.icbc",
+    "cmb.pb",
+    "com.unionpay",
+    "com.greenpoint.android.mc10086.activity",
+    "com.hpbr.bosszhipin",
+    "com.beisen.italent",
+    "com.hose.ekuaibao",
+    "com.ss.android.lark",
+    "com.tencent.wemeet.app",
+    "com.tencent.mm",
+    "com.tencent.mobileqq",
+    "com.tencent.androidqqmail",
+    "com.eg.android.AlipayGphone",
+    "com.taobao.taobao",
+    "com.xunmeng.pinduoduo",
+    "com.sankuai.meituan",
+    "com.wudaokou.hippo",
+    "com.didi.es.psngr",
+    "com.autonavi.minimap",
+    "ctrip.android.view",
+    "com.htinns",
+    "com.anjuke.android.app",
+    "com.wiwj.xiangyucustomer",
+    "com.sz.yuanqu.health",
+    "com.wisedu.cpdaily",
+    "com.chaoxing.mobile",
+    "com.supwisdom.dq",
+    "tv.danmaku.bili",
+    "com.coolapk.market",
+    "com.netease.cloudmusic",
+    "com.netease.mail",
+    "com.netease.uu",
+    "cn.wps.moffice_eng.xiaomi.lite",
+    "com.deepseek.chat",
+    "ai.qwenlm.chat.android",
+    "com.copymanga.app",
+    "com.accuvally.hdtui",
+    "com.unnoo.quan",
+    "com.zb.sph.zaobaochina",
+    "com.zhuawa.filerecovery",
+    "net.huanci.hsj",
+    "net.huanci.hsjpro",
+    "net.lk.qingguo",
+    "com.mipay.wallet",
+    "com.xiaomi.shop",
+    "com.xiaomi.smarthome",
+    "com.mi.health",
+)
+
+SYSTEM_NO_APPLIST_PKGS: tuple[str, ...] = (
+    "com.xiaomi.market",
+    "com.miui.cloudbackup",
+    "com.miui.cloudservice",
+    "com.xiaomi.xmsf",
+    "com.mediatek.duraspeed",
+    "com.qualcomm.qti.workloadclassifier",
+    "com.duokan.phone.remotecontroller",
+    "com.miui.weather2",
+    "com.mfashiongallery.emag",
+    "com.xiaomi.mibrain.speech",
+    "com.xiaomi.scanner",
+    "com.miui.themestore",
+    "com.miui.player",
+    "com.miui.notes",
+    "com.miui.huanji",
+)
+
+PACKAGEINSTALLER_RISK_DB_PATH = (
+    "/data/user/0/com.miui.packageinstaller/databases/app_security_risk_app.db"
+)
+PACKAGEINSTALLER_RISK_TABLES: tuple[str, ...] = (
+    "security_install_other_app_info",
+    "app_security_level",
+    "risk_control_rules",
+    "source_authority_info",
+    "install_history",
+    "app_active_stat",
+)
+
+EXPECTED_SETTINGS: dict[str, dict[str, str]] = {
+    "secure": {
+        "upload_apk_enable": "0",
+        "security_pc_secure_protect_mode_key": "0",
+        "sec_pc_config_scenario_policies_open": "0",
+        "passport_ad_status": "OFF",
+        "upload_log_pref": "0",
+        "upload_debug_log_pref": "0",
+        "key_latest_virus_scan_date": "0",
+    },
+    "global": {
+        "package_verifier_enable": "0",
+        "verifier_verify_adb_installs": "0",
+    },
+    "system": {
+        "KEY_FBO_DATA": "",
+        "FBO_UPLOAD_LIST": "",
+    },
+}
+
+DEFAULT_WHITELIST_CANDIDATES: tuple[str, ...] = (
+    "com.follow.clash",
+    "com.appshub.bettbox",
+)
+
+REMOTE_PROVIDER_PREFS_PATH = (
+    "/data/user/0/com.miui.securitycenter/shared_prefs/remote_provider_preferences.xml"
+)
+ANTIVIRUSSCAN_PREFS_PATH = (
+    "/data/user/0/com.miui.securitycenter/shared_prefs/antivirusscan_pref_data.xml"
+)
+HYPERCEILER_PREFS_PATH = (
+    "/data/user_de/0/com.sevtinge.hyperceiler/shared_prefs/hyperceiler_prefs.xml"
+)
+SECURITYCENTER_LOCKED_DBS: tuple[tuple[str, str, str], ...] = (
+    (
+        "/data/user/0/com.miui.securitycenter/databases/onetrack_cache",
+        "events",
+        "drop_events",
+    ),
+    (
+        "/data/user/0/com.miui.securitycenter/databases/app_predict_data.db",
+        "app_predict_table",
+        "drop_app_predict",
+    ),
+)
+SENSITIVE_BLUR_RE = re.compile(
+    "|".join(
+        [SENSITIVE_LOG_REGEX]
+        + [re.escape(p) for p in (*HMA_HIDE_ROOT_LIST, *HMA_HIDE_SENSITIVE_LIST)]
+    ),
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class AdbDevice:
+    serial: str
+
+    def run(self, *args: str, timeout: int = 20, check: bool = True) -> str:
+        result = subprocess.run(
+            ["adb", "-s", self.serial, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = (result.stdout + result.stderr).strip()
+        if check and result.returncode != 0:
+            raise RuntimeError(output or f"adb -s {self.serial} {' '.join(args)} failed")
+        return output
+
+    def shell(self, command: str, timeout: int = 20, check: bool = True) -> str:
+        return self.run("shell", command, timeout=timeout, check=check)
+
+    def root_shell(self, command: str, timeout: int = 30, check: bool = True) -> str:
+        escaped = command.replace("'", "'\"'\"'")
+        return self.shell(f"su -c '{escaped}'", timeout=timeout, check=check)
+
+    def has_root(self) -> bool:
+        out = self.shell("su -c id", check=False)
+        return "uid=0(root)" in out
+
+
+def list_connected_serials() -> list[str]:
+    result = subprocess.run(
+        ["adb", "devices"], capture_output=True, text=True, timeout=10, check=True
+    )
+    serials: list[str] = []
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            serials.append(parts[0])
+    return serials
+
+
+def resolve_devices(serial: str | None, all_devices: bool) -> list[AdbDevice]:
+    connected = list_connected_serials()
+    if not connected:
+        raise RuntimeError("No connected ADB devices in 'device' state.")
+    if serial:
+        if serial not in connected:
+            raise RuntimeError(
+                f"Device '{serial}' not found. Connected: {', '.join(connected)}"
+            )
+        return [AdbDevice(serial)]
+    if all_devices or len(connected) == 1:
+        return [AdbDevice(s) for s in connected]
+    raise RuntimeError(
+        f"Multiple ADB devices connected ({', '.join(connected)}). "
+        "Specify -s/--serial or --all."
+    )
+
+
+def clean_remote_provider_xml(xml_text: str, whitelist_pkgs: list[str]) -> str:
+    root = ET.fromstring(xml_text)
+    for elem in list(root):
+        name = elem.attrib.get("name", "")
+        if name.startswith("key_anti_fraud_reject_permission"):
+            root.remove(elem)
+        elif name in (
+            "key_is_guard_support",
+            "key_auto_upload_batteryhealth",
+            "key_open_virus_cloud_scan",
+        ):
+            elem.attrib["value"] = "false"
+        elif name in ("key_latest_virus_scan_date", "key_full_scan_time"):
+            elem.attrib["value"] = "0"
+        elif name in ("key_anti_fraud_packages", "KEY_FBO_RESULT_PKG_LIST"):
+            for child in list(elem):
+                elem.remove(child)
+        elif name == "key_app_predict_list":
+            elem.text = "[]"
+        elif name == "privacy_thumbnail_blur_category" and elem.text:
+            try:
+                mapping = json.loads(elem.text)
+                cleaned_map = {
+                    k: v
+                    for k, v in mapping.items()
+                    if not SENSITIVE_BLUR_RE.search(k) and v != -1
+                }
+                elem.text = json.dumps(cleaned_map, separators=(",", ":"))
+            except json.JSONDecodeError:
+                elem.text = "{}"
+
+    def set_bool(key: str, val: str) -> None:
+        for elem in root.findall("boolean"):
+            if elem.attrib.get("name") == key:
+                elem.attrib["value"] = val
+                return
+        el = ET.SubElement(root, "boolean")
+        el.attrib["name"] = key
+        el.attrib["value"] = val
+
+    set_bool("key_is_guard_support", "false")
+    set_bool("key_auto_upload_batteryhealth", "false")
+    set_bool("key_open_virus_cloud_scan", "false")
+
+    whitelist = None
+    for elem in root.findall("set"):
+        if elem.attrib.get("name") == "key_white_list_app":
+            whitelist = elem
+            break
+    if whitelist is None:
+        whitelist = ET.SubElement(root, "set")
+        whitelist.attrib["name"] = "key_white_list_app"
+    existing = {child.text for child in whitelist.findall("string") if child.text}
+    for pkg in whitelist_pkgs:
+        if pkg not in existing:
+            s = ET.SubElement(whitelist, "string")
+            s.text = pkg
+
+    ET.indent(root, space="    ")
+    return '<?xml version=\'1.0\' encoding=\'utf-8\' standalone=\'yes\' ?>\n' + ET.tostring(
+        root, encoding="unicode"
+    ) + "\n"
+
+
+def update_hyperceiler_xml(xml_text: str) -> str:
+    root = ET.fromstring(xml_text)
+    desired = {
+        "prefs_key_system_framework_disable_verification_agent": "true",
+        "prefs_key_security_center_remove_open_app_confirmation_popup": "true",
+    }
+    for key, val in desired.items():
+        found = False
+        for elem in root.findall("boolean"):
+            if elem.attrib.get("name") == key:
+                elem.attrib["value"] = val
+                found = True
+                break
+        if not found:
+            el = ET.SubElement(root, "boolean")
+            el.attrib["name"] = key
+            el.attrib["value"] = val
+    ET.indent(root, space="    ")
+    return '<?xml version=\'1.0\' encoding=\'utf-8\' standalone=\'yes\' ?>\n' + ET.tostring(
+        root, encoding="unicode"
+    ) + "\n"
+
+
+def backup_device(dev: AdbDevice, backup_root: Path) -> Path:
+    codename = dev.shell("getprop ro.product.name") or dev.serial
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = backup_root / f"{stamp}-{codename}"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "packages_enabled.txt").write_text(
+        dev.shell("pm list packages -e") + "\n", encoding="utf-8"
+    )
+    (target / "packages_disabled.txt").write_text(
+        dev.shell("pm list packages -d") + "\n", encoding="utf-8"
+    )
+    for ns in ("system", "secure", "global"):
+        (target / f"settings_{ns}.txt").write_text(
+            dev.shell(f"settings list {ns}") + "\n", encoding="utf-8"
+        )
+    if dev.has_root():
+        rp_xml = dev.root_shell(f"cat {REMOTE_PROVIDER_PREFS_PATH}", check=False)
+        if rp_xml.startswith("<?xml"):
+            (target / "remote_provider_preferences.xml").write_text(
+                rp_xml + "\n", encoding="utf-8"
+            )
+        hc_xml = dev.root_shell(f"cat {HYPERCEILER_PREFS_PATH}", check=False)
+        if hc_xml.startswith("<?xml"):
+            (target / "hyperceiler_prefs.xml").write_text(hc_xml + "\n", encoding="utf-8")
+    return target
+
+
+def apply_device(
+    dev: AdbDevice, backup_dir: Path | None, extra_whitelist: list[str]
+) -> None:
+    if not dev.has_root():
+        raise RuntimeError(
+            f"[{dev.serial}] Root access denied for com.android.shell. "
+            "Enable Shell root in KernelSU Manager first."
+        )
+    model = dev.shell("getprop ro.product.model")
+    codename = dev.shell("getprop ro.product.name")
+    print(f"=== Applying HyperOS privacy cleanup on {model} ({codename} / {dev.serial}) ===")
+
+    if backup_dir is not None:
+        saved = backup_device(dev, backup_dir)
+        print(f"  [Backup] Saved baseline to {saved}")
+
+    # 1. Disable monitoring/telemetry/cloud-control/content-catcher packages
+    installed_all = set(
+        line.removeprefix("package:").strip()
+        for line in dev.shell("pm list packages").splitlines()
+        if line.startswith("package:")
+    )
+    for pkg in DISABLED_PACKAGES:
+        if pkg in installed_all:
+            dev.root_shell(
+                f"pm clear {pkg} >/dev/null 2>&1 || true; "
+                f"pm disable-user --user 0 {pkg} >/dev/null 2>&1 || true; "
+                f"am force-stop {pkg} >/dev/null 2>&1 || true"
+            )
+    dev.root_shell(
+        "rm -rf /data/user/0/com.mobiletools.systemhelper/.cesium 2>/dev/null || true"
+    )
+
+    # 2. Ensure SecurityCenter JobService components remain enabled, disable non-JobService components
+    for comp in SECURITYCENTER_REQUIRED_JOB_COMPONENTS:
+        dev.root_shell(f"pm enable {comp} >/dev/null 2>&1 || true")
+    for comp in SECURITYCENTER_DISABLED_COMPONENTS:
+        dev.root_shell(f"pm disable {comp} >/dev/null 2>&1 || true")
+    for comp in DAEMON_DISABLED_COMPONENTS:
+        dev.root_shell(f"pm disable {comp} >/dev/null 2>&1 || true")
+    for comp in PACKAGEINSTALLER_DISABLED_COMPONENTS:
+        dev.root_shell(f"pm disable {comp} >/dev/null 2>&1 || true")
+    for comp in XMSF_DISABLED_COMPONENTS + XMSF_OPTIONAL_DISABLED_COMPONENTS:
+        dev.root_shell(f"pm disable {comp} >/dev/null 2>&1 || true")
+
+    # 2b. Sanitize PackageInstaller risk database and recent-install cache
+    dev.root_shell(
+        "am force-stop com.miui.packageinstaller; "
+        "rm -f /data/user/0/com.miui.packageinstaller/shared_prefs/RecentAppInfo.xml "
+        "/data/user/0/com.miui.packageinstaller/shared_prefs/one_track_pref.xml 2>/dev/null || true"
+    )
+    has_pi_db = dev.root_shell(
+        f"test -f {PACKAGEINSTALLER_RISK_DB_PATH} && echo yes || echo no",
+        check=False,
+    )
+    if has_pi_db.strip() == "yes":
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_db = Path(tmpdir) / "pi_risk.db"
+            dev.root_shell(
+                f"cp {PACKAGEINSTALLER_RISK_DB_PATH} /data/local/tmp/pi_risk.db && "
+                "chmod 644 /data/local/tmp/pi_risk.db"
+            )
+            dev.run("pull", "/data/local/tmp/pi_risk.db", str(local_db))
+            conn = sqlite3.connect(local_db)
+            existing_tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            for table in PACKAGEINSTALLER_RISK_TABLES:
+                if table in existing_tables:
+                    conn.execute(f"DELETE FROM `{table}`")
+            conn.commit()
+            conn.execute("VACUUM")
+            conn.close()
+            dev.run("push", str(local_db), "/data/local/tmp/pi_risk.db")
+            dev.root_shell(
+                f"ug=$(stat -c '%u:%g' {PACKAGEINSTALLER_RISK_DB_PATH}) && "
+                f"rm -f {PACKAGEINSTALLER_RISK_DB_PATH}-journal {PACKAGEINSTALLER_RISK_DB_PATH}-wal {PACKAGEINSTALLER_RISK_DB_PATH}-shm && "
+                f"cp /data/local/tmp/pi_risk.db {PACKAGEINSTALLER_RISK_DB_PATH} && "
+                f"chown \"$ug\" {PACKAGEINSTALLER_RISK_DB_PATH} && "
+                f"chmod 660 {PACKAGEINSTALLER_RISK_DB_PATH} && "
+                f"restorecon {PACKAGEINSTALLER_RISK_DB_PATH} 2>/dev/null || true; "
+                "rm -f /data/local/tmp/pi_risk.db; "
+                "am force-stop com.miui.packageinstaller"
+            )
+
+    # 3. Clean SecurityCenter remote_provider_preferences.xml
+    whitelist_pkgs = [
+        pkg for pkg in DEFAULT_WHITELIST_CANDIDATES if pkg in installed_all
+    ]
+    for pkg in extra_whitelist:
+        if pkg not in whitelist_pkgs:
+            whitelist_pkgs.append(pkg)
+
+    dev.root_shell("am force-stop com.miui.securitycenter")
+    rp_xml = dev.root_shell(f"cat {REMOTE_PROVIDER_PREFS_PATH}", check=False)
+    if rp_xml.startswith("<?xml"):
+        cleaned = clean_remote_provider_xml(rp_xml, whitelist_pkgs)
+        proc = subprocess.run(
+            [
+                "adb",
+                "-s",
+                dev.serial,
+                "shell",
+                f"su -c 'cat > {REMOTE_PROVIDER_PREFS_PATH}'",
+            ],
+            input=cleaned,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=True,
+        )
+        _ = proc
+        dev.root_shell(
+            f"chown system:system {REMOTE_PROVIDER_PREFS_PATH} && "
+            f"chmod 660 {REMOTE_PROVIDER_PREFS_PATH} && "
+            f"restorecon {REMOTE_PROVIDER_PREFS_PATH} >/dev/null 2>&1 || true; "
+            "rm -rf /data/user/0/com.miui.securitycenter/cache/* "
+            "/data/user/0/com.miui.securitycenter/code_cache/* "
+            "/data/user/0/com.miui.securitycenter/app_webview/* 2>/dev/null || true; "
+            "am force-stop com.miui.securitycenter"
+        )
+
+    # 3b. Suppress 7-day scan nag notification (id=1012) and background anti-fraud scan
+    antivirus_xml = (
+        "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n"
+        "<map>\n"
+        '    <boolean name="key_is_background_anti_fraud_scan" value="false" />\n'
+        '    <int name="key_antivirus_notification_show_count" value="99" />\n'
+        '    <long name="key_antivirus_notification_show_time" value="1794503011947" />\n'
+        '    <long name="key_anti_fraud_scan_time" value="0" />\n'
+        "</map>\n"
+    )
+    subprocess.run(
+        [
+            "adb",
+            "-s",
+            dev.serial,
+            "shell",
+            f"su -c 'cat > {ANTIVIRUSSCAN_PREFS_PATH}'",
+        ],
+        input=antivirus_xml,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=True,
+    )
+    dev.root_shell(
+        f"chown system:system {ANTIVIRUSSCAN_PREFS_PATH} && "
+        f"chmod 660 {ANTIVIRUSSCAN_PREFS_PATH} && "
+        f"restorecon {ANTIVIRUSSCAN_PREFS_PATH} >/dev/null 2>&1 || true"
+    )
+
+    # 3c. Empty SecurityCenter telemetry/prediction SQLite caches and install RAISE(IGNORE) triggers
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for remote_db, table, trig in SECURITYCENTER_LOCKED_DBS:
+            exists = dev.root_shell(
+                f"test -f {remote_db} && echo yes || echo no", check=False
+            ).strip()
+            if exists != "yes":
+                continue
+            local_db = Path(tmpdir) / Path(remote_db).name
+            dev.root_shell(
+                f"cp {remote_db} /data/local/tmp/sc_lock.db && chmod 644 /data/local/tmp/sc_lock.db"
+            )
+            dev.run("pull", "/data/local/tmp/sc_lock.db", str(local_db))
+            conn = sqlite3.connect(local_db)
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if table in tables:
+                conn.execute(f"DELETE FROM `{table}`")
+                if "sqlite_sequence" in tables:
+                    conn.execute("DELETE FROM `sqlite_sequence`")
+                conn.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS `{trig}` BEFORE INSERT ON `{table}` "
+                    "BEGIN SELECT RAISE(IGNORE); END"
+                )
+                conn.commit()
+                conn.execute("VACUUM")
+            conn.close()
+            dev.run("push", str(local_db), "/data/local/tmp/sc_lock.db")
+            dev.root_shell(
+                f"ug=$(stat -c '%u:%g' {remote_db}) && "
+                f"rm -f {remote_db}-journal {remote_db}-wal {remote_db}-shm && "
+                f"cp /data/local/tmp/sc_lock.db {remote_db} && "
+                f"chown \"$ug\" {remote_db} && chmod 660 {remote_db} && "
+                f"restorecon {remote_db} 2>/dev/null || true; "
+                "rm -f /data/local/tmp/sc_lock.db"
+            )
+    dev.root_shell("am force-stop com.miui.securitycenter")
+
+    # 4. Update system/secure/global settings
+    for ns, kv in EXPECTED_SETTINGS.items():
+        for k, v in kv.items():
+            val_arg = '""' if v == "" else v
+            dev.root_shell(f"settings put {ns} {k} {val_arg}")
+
+    # 5. Update HyperCeiler preferences and clear Safe Mode crash lock if set
+    hc_xml = dev.root_shell(f"cat {HYPERCEILER_PREFS_PATH}", check=False)
+    if hc_xml.startswith("<?xml"):
+        updated_hc = update_hyperceiler_xml(hc_xml)
+        subprocess.run(
+            [
+                "adb",
+                "-s",
+                dev.serial,
+                "shell",
+                f"su -c 'cat > {HYPERCEILER_PREFS_PATH}'",
+            ],
+            input=updated_hc,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=True,
+        )
+        dev.root_shell(
+            f"chmod 664 {HYPERCEILER_PREFS_PATH} && "
+            f"restorecon {HYPERCEILER_PREFS_PATH} >/dev/null 2>&1 || true"
+        )
+    dev.root_shell("setprop persist.service.hyperceiler.crash.report ''")
+
+    # 6. Sanitize XMSF, system caches, /data/system package logs, and third-party SDK caches
+    dev.root_shell(
+        "rm -f /data/user/0/com.xiaomi.xmsf/shared_prefs/mipush_app_enter_front_info.xml "
+        "/data/user/0/com.xiaomi.xmsf/shared_prefs/last_running_data.xml "
+        "/data/user/0/com.xiaomi.xmsf/shared_prefs/collect_record_data.xml "
+        "/data/user/0/com.xiaomi.xmsf/shared_prefs/one_track_pref.xml "
+        "/data/user/0/com.xiaomi.xmsf/shared_prefs/mipush_aipush_package_status.xml "
+        "/data/user/0/com.miui.daemon/databases/* "
+        "/data/user/0/com.miui.cleanmaster/databases/* "
+        "/data/user/0/com.miui.securitycenter/shared_prefs/safe_access.xml "
+        "/data/user/0/com.miui.securitycenter/shared_prefs/safe_access_record.xml "
+        "/data/user/0/com.miui.securitycenter/shared_prefs/one_track_pref.xml "
+        "/data/user/0/com.miui.securitycenter/shared_prefs/predict_sp_key.xml "
+        "/data/user/0/com.lbe.security.miui/databases/miui_ngen.db* "
+        "/data/user/0/com.lbe.security.miui/databases/wake_path.db* "
+        "/data/user/0/com.lbe.security.miui/shared_prefs/PermissionRejectNoticeData.xml "
+        "/data/user_de/0/com.android.htmlviewer/databases/cloud_all_data.db* "
+        "/data/user/0/com.mediatek.duraspeed/databases/app_list.db* "
+        "/data/user/0/com.qualcomm.qti.workloadclassifier/databases/WLCHG.db* "
+        "/data/user/0/com.android.quicksearchbox/databases/applications.db* "
+        "/data/user/0/com.miui.cloudbackup/databases/cache.db* "
+        "/data/user/0/com.miui.backup/shared_prefs/com.miui.backup.PREF_LIST_FILES.xml "
+        "/data/user/0/com.xiaomi.market/databases/market_2.db* "
+        "/data/system/procstartstore/procstartinfo /data/system/procexitstore/procexitinfo 2>/dev/null || true; "
+        "if [ -f /data/user/0/com.miui.securitycore/shared_prefs/security_core.xml ]; then "
+        "  sed -i '/twitter\\.android/d' /data/user/0/com.miui.securitycore/shared_prefs/security_core.xml; "
+        "  restorecon /data/user/0/com.miui.securitycore/shared_prefs/security_core.xml 2>/dev/null || true; "
+        "fi; "
+        "for f in /data/user/0/*/shared_prefs/*pangle*.xml; do "
+        "  if [ -f \"$f\" ]; then sed -i '/install_app_string/d' \"$f\"; restorecon \"$f\" 2>/dev/null || true; fi; "
+        "done; "
+        f"for f in /data/system/pkg_history.txt /data/system/package-event/*; do "
+        f"  if [ -f \"$f\" ]; then {{ grep -viE '{SENSITIVE_LOG_REGEX}' \"$f\" > \"$f.tmp\" || true; }} && mv \"$f.tmp\" \"$f\" && chmod 600 \"$f\" && chown system:system \"$f\" && restorecon \"$f\" 2>/dev/null || true; fi; "
+        f"done"
+    )
+
+    # 7. Lock GET_INSTALLED_APPS (op 10022) to ignore for domestic and probe packages
+    appops_cmds = [
+        f"appops set --user 0 {pkg} 10022 ignore 2>/dev/null || true; "
+        f"appops set --user 0 {pkg} GET_INSTALLED_APPS ignore 2>/dev/null || true"
+        for pkg in (*DOMESTIC_SCOPED_APPS, *SYSTEM_NO_APPLIST_PKGS)
+    ]
+    dev.root_shell("; ".join(appops_cmds))
+
+    # 8. Harden Hide My Applist (org.frknkrc44.hma_oss) templates and domestic app scopes
+    misc_dir = dev.root_shell(
+        "ls -d /data/misc/hide_my_applist_* 2>/dev/null | head -n1", check=False
+    ).strip()
+    if misc_dir:
+        raw_cfg = dev.root_shell(f"cat {misc_dir}/config.json", check=False)
+        cfg = json.loads(raw_cfg) if raw_cfg.startswith("{") else {"configVersion": 93}
+        installed_3p = set(
+            line.removeprefix("package:").strip()
+            for line in dev.shell("pm list packages -3").splitlines()
+            if line.startswith("package:")
+        )
+        cfg.setdefault("configVersion", 93)
+        cfg["forceMountData"] = True
+        cfg["webViewProtection"] = True
+        templates = cfg.setdefault("templates", {})
+        templates["hide root"] = {"isWhitelist": False, "appList": list(HMA_HIDE_ROOT_LIST)}
+        templates["hide sensitive"] = {
+            "isWhitelist": False,
+            "appList": list(HMA_HIDE_SENSITIVE_LIST),
+        }
+        scope = cfg.setdefault("scope", {})
+        presets = [
+            "accessibility_apps",
+            "custom_rom",
+            "detector_apps",
+            "root_apps",
+            "shizuku_dhizuku",
+            "sus_apps",
+            "xposed",
+        ]
+        for pkg in DOMESTIC_SCOPED_APPS:
+            if pkg in installed_3p or pkg in scope:
+                scope[pkg] = {
+                    "useWhitelist": False,
+                    "excludeSystemApps": True,
+                    "hideInstallationSource": False,
+                    "hideSystemInstallationSource": False,
+                    "excludeTargetInstallationSource": False,
+                    "invertActivityLaunchProtection": False,
+                    "excludeVoldIsolation": False,
+                    "restrictedZygotePermissions": [],
+                    "applyTemplates": ["hide root", "hide sensitive"],
+                    "applyPresets": presets,
+                    "applySettingTemplates": [],
+                    "applySettingsPresets": [],
+                    "extraAppList": [],
+                    "extraOppositeAppList": [],
+                }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_cfg = Path(tmpdir) / "hma_cfg.json"
+            local_cfg.write_text(
+                json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            dev.run("push", str(local_cfg), "/data/local/tmp/hma_cfg.json")
+            dev.root_shell(
+                f"cp /data/local/tmp/hma_cfg.json {misc_dir}/config.json && "
+                f"chown system:system {misc_dir}/config.json && chmod 600 {misc_dir}/config.json && "
+                f"restorecon {misc_dir}/config.json 2>/dev/null || true; "
+                "if [ -d /data/user/0/org.frknkrc44.hma_oss/files ]; then "
+                "  owner=$(stat -c '%u:%g' /data/user/0/org.frknkrc44.hma_oss/files); "
+                "  cp /data/local/tmp/hma_cfg.json /data/user/0/org.frknkrc44.hma_oss/files/config.json && "
+                "  chown $owner /data/user/0/org.frknkrc44.hma_oss/files/config.json && "
+                "  chmod 600 /data/user/0/org.frknkrc44.hma_oss/files/config.json && "
+                "  restorecon /data/user/0/org.frknkrc44.hma_oss/files/config.json 2>/dev/null || true; "
+                "fi; "
+                "rm -f /data/local/tmp/hma_cfg.json; "
+                "am force-stop org.frknkrc44.hma_oss; "
+                "am broadcast -n org.frknkrc44.hma_oss/androidx.profileinstaller.ProfileInstallReceiver "
+                "-a androidx.profileinstaller.action.INSTALL_PROFILE >/dev/null 2>&1 || true"
+            )
+
+
+def check_device(dev: AdbDevice) -> bool:
+    model = dev.shell("getprop ro.product.model")
+    codename = dev.shell("getprop ro.product.name")
+    os_ver = dev.shell("getprop ro.build.version.incremental") or dev.shell(
+        "getprop ro.mi.os.version.name"
+    )
+    android_ver = dev.shell("getprop ro.build.version.release")
+    has_root = dev.has_root()
+
+    print(
+        f"=== Device: {model} ({codename} / {dev.serial}) | "
+        f"HyperOS {os_ver} (Android {android_ver}) | Root(Shell): {'YES' if has_root else 'NO'} ==="
+    )
+    failures: list[str] = []
+
+    # 1. Check disabled packages
+    enabled_pkgs = set(
+        line.removeprefix("package:").strip()
+        for line in dev.shell("pm list packages -e").splitlines()
+        if line.startswith("package:")
+    )
+    still_enabled = [pkg for pkg in DISABLED_PACKAGES if pkg in enabled_pkgs]
+    if still_enabled:
+        failures.append(f"Packages still enabled: {', '.join(still_enabled)}")
+    else:
+        print(f"  [OK] All {len(DISABLED_PACKAGES)} monitoring/telemetry/cloud-control packages disabled")
+
+    # 2. Check settings
+    setting_drifts: list[str] = []
+    for ns, kv in EXPECTED_SETTINGS.items():
+        for k, expected in kv.items():
+            actual = dev.shell(f"settings get {ns} {k}")
+            if actual == "null":
+                actual = ""
+            if actual != expected:
+                setting_drifts.append(f"{ns}:{k}={actual!r} (expected {expected!r})")
+    if setting_drifts:
+        failures.append("Settings drift: " + ", ".join(setting_drifts))
+    else:
+        print("  [OK] System/Secure/Global privacy settings locked")
+
+    # 3. Check HyperCeiler crash property
+    crash_prop = dev.shell("getprop persist.service.hyperceiler.crash.report")
+    if crash_prop:
+        failures.append(
+            f"HyperCeiler Safe Mode lock active: persist.service.hyperceiler.crash.report={crash_prop!r}"
+        )
+    else:
+        print("  [OK] HyperCeiler Safe Mode crash lock is clear")
+
+    if has_root:
+        # 4. Check SecurityCenter component states via dumpsys package
+        sc_dump = dev.root_shell("dumpsys package com.miui.securitycenter")
+        disabled_section = ""
+        if "disabledComponents:" in sc_dump:
+            disabled_section = sc_dump.split("disabledComponents:", 1)[1].split(
+                "enabledComponents:", 1
+            )[0]
+        missing_disabled = [
+            comp.split("/", 1)[1]
+            for comp in SECURITYCENTER_DISABLED_COMPONENTS
+            if comp.split("/", 1)[1] not in disabled_section
+        ]
+        if missing_disabled:
+            failures.append(
+                f"SecurityCenter components not disabled: {', '.join(missing_disabled)}"
+            )
+        else:
+            print(
+                f"  [OK] All {len(SECURITYCENTER_DISABLED_COMPONENTS)} SecurityCenter anti-fraud/antivirus components disabled"
+            )
+
+        bad_disabled_jobs = [
+            comp.split("/", 1)[1]
+            for comp in SECURITYCENTER_REQUIRED_JOB_COMPONENTS
+            if comp.split("/", 1)[1] in disabled_section
+        ]
+        if bad_disabled_jobs:
+            failures.append(
+                f"SecurityCenter JobServices disabled (risk of CrashMonitor lock): {', '.join(bad_disabled_jobs)}"
+            )
+
+        # 4b. Check PackageInstaller component states and RecentAppInfo.xml (if installed/enabled)
+        if "com.miui.packageinstaller" in enabled_pkgs:
+            pi_dump = dev.root_shell("dumpsys package com.miui.packageinstaller")
+            pi_disabled = ""
+            if "disabledComponents:" in pi_dump:
+                pi_disabled = pi_dump.split("disabledComponents:", 1)[1].split(
+                    "enabledComponents:", 1
+                )[0]
+            missing_pi_disabled = [
+                comp.split("/", 1)[1]
+                for comp in PACKAGEINSTALLER_DISABLED_COMPONENTS
+                if comp.split("/", 1)[1] not in pi_disabled
+            ]
+            recent_exists = dev.root_shell(
+                "test -f /data/user/0/com.miui.packageinstaller/shared_prefs/RecentAppInfo.xml && echo yes || echo no",
+                check=False,
+            ).strip()
+            if missing_pi_disabled or recent_exists == "yes":
+                failures.append(
+                    f"PackageInstaller not fully sanitized (missing_disabled={missing_pi_disabled}, RecentAppInfo={recent_exists})"
+                )
+            else:
+                print(
+                    f"  [OK] PackageInstaller telemetry receivers ({len(PACKAGEINSTALLER_DISABLED_COMPONENTS)}) disabled and RecentAppInfo.xml removed"
+                )
+
+        # 5. Check remote_provider_preferences.xml, scan-nag suppression, and SecurityCenter DB locks
+        rp_xml = dev.root_shell(f"cat {REMOTE_PROVIDER_PREFS_PATH}", check=False)
+        if rp_xml.startswith("<?xml"):
+            root = ET.fromstring(rp_xml)
+            guard_sup = next(
+                (
+                    e.attrib.get("value")
+                    for e in root.findall("boolean")
+                    if e.attrib.get("name") == "key_is_guard_support"
+                ),
+                "false",
+            )
+            reject_keys = [
+                e.attrib.get("name", "")
+                for e in root
+                if e.attrib.get("name", "").startswith(
+                    "key_anti_fraud_reject_permission"
+                )
+            ]
+            fbo_items = [
+                c.text
+                for e in root.findall("set")
+                if e.attrib.get("name") in ("KEY_FBO_RESULT_PKG_LIST", "key_anti_fraud_packages")
+                for c in e.findall("string")
+                if c.text
+            ]
+            predict_text = next(
+                (
+                    (e.text or "").strip()
+                    for e in root.findall("string")
+                    if e.attrib.get("name") == "key_app_predict_list"
+                ),
+                "[]",
+            )
+            blur_text = next(
+                (
+                    e.text or ""
+                    for e in root.findall("string")
+                    if e.attrib.get("name") == "privacy_thumbnail_blur_category"
+                ),
+                "",
+            )
+            blur_leaks = bool(SENSITIVE_BLUR_RE.search(blur_text))
+            if (
+                guard_sup != "false"
+                or reject_keys
+                or fbo_items
+                or predict_text not in ("", "[]")
+                or blur_leaks
+            ):
+                failures.append(
+                    "remote_provider_preferences dirty "
+                    f"(guard={guard_sup}, reject={len(reject_keys)}, fbo={len(fbo_items)}, "
+                    f"predict_nonempty={predict_text not in ('', '[]')}, blur_leaks={blur_leaks})"
+                )
+            else:
+                print("  [OK] SecurityCenter remote_provider_preferences.xml clean")
+
+        av_xml = dev.root_shell(f"cat {ANTIVIRUSSCAN_PREFS_PATH}", check=False)
+        if av_xml.startswith("<?xml"):
+            av_root = ET.fromstring(av_xml)
+            bg_af = next(
+                (
+                    e.attrib.get("value")
+                    for e in av_root.findall("boolean")
+                    if e.attrib.get("name") == "key_is_background_anti_fraud_scan"
+                ),
+                "true",
+            )
+            show_cnt = int(
+                next(
+                    (
+                        e.attrib.get("value", "0")
+                        for e in av_root.findall("int")
+                        if e.attrib.get("name") == "key_antivirus_notification_show_count"
+                    ),
+                    "0",
+                )
+            )
+            if bg_af != "false" or show_cnt < 3:
+                failures.append(
+                    f"antivirusscan_pref_data not locked (bg_anti_fraud={bg_af}, show_count={show_cnt})"
+                )
+            else:
+                print("  [OK] SecurityCenter 7-day scan nag and background anti-fraud scan suppressed")
+        else:
+            failures.append("antivirusscan_pref_data.xml missing or unreadable")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_lock_ok = True
+            for remote_db, table, trig in SECURITYCENTER_LOCKED_DBS:
+                exists = dev.root_shell(
+                    f"test -f {remote_db} && echo yes || echo no", check=False
+                ).strip()
+                if exists != "yes":
+                    continue
+                local_db = Path(tmpdir) / Path(remote_db).name
+                dev.root_shell(
+                    f"cp {remote_db} /data/local/tmp/sc_chk.db && chmod 644 /data/local/tmp/sc_chk.db"
+                )
+                dev.run("pull", "/data/local/tmp/sc_chk.db", str(local_db))
+                dev.root_shell("rm -f /data/local/tmp/sc_chk.db")
+                conn = sqlite3.connect(local_db)
+                cnt = conn.execute(f"SELECT count(*) FROM `{table}`").fetchone()[0]
+                has_trig = (
+                    conn.execute(
+                        "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name=?",
+                        (trig,),
+                    ).fetchone()[0]
+                    > 0
+                )
+                conn.close()
+                if cnt != 0 or not has_trig:
+                    db_lock_ok = False
+                    failures.append(
+                        f"{Path(remote_db).name} unlocked or non-empty (rows={cnt}, trigger={has_trig})"
+                    )
+            if db_lock_ok:
+                print(
+                    "  [OK] SecurityCenter onetrack_cache and app_predict_data.db empty with RAISE(IGNORE) triggers"
+                )
+
+        # Never overlay/remove /system_ext/app/MiuiDaemon APK (causes HyperOS 3 system_server RescueParty bootloop);
+        # instead verify its 6 MQS/perf components are disabled and mqsas.db remains absent.
+        daemon_dump = dev.root_shell("dumpsys package com.miui.daemon", check=False)
+        daemon_disabled = ""
+        if "disabledComponents:" in daemon_dump:
+            daemon_disabled = daemon_dump.split("disabledComponents:", 1)[1].split(
+                "enabledComponents:", 1
+            )[0]
+        missing_daemon = [
+            comp.split("/", 1)[1]
+            for comp in DAEMON_DISABLED_COMPONENTS
+            if comp.split("/", 1)[1] not in daemon_disabled
+        ]
+        mqsas_exists = dev.root_shell(
+            "ls /data/user/0/com.miui.daemon/databases/mqsas* 2>/dev/null | wc -l",
+            check=False,
+        ).strip()
+        if missing_daemon or mqsas_exists != "0":
+            failures.append(
+                f"com.miui.daemon MQS boundary incomplete (missing_disabled={missing_daemon}, mqsas_files={mqsas_exists})"
+            )
+        else:
+            print(
+                f"  [OK] com.miui.daemon MQS/performance components ({len(DAEMON_DISABLED_COMPONENTS)}) disabled and mqsas.db absent"
+            )
+
+        # 6. Check HyperCeiler active memory mapping in SecurityCenter
+        sc_pid = dev.root_shell("pidof com.miui.securitycenter", check=False).split()
+        if sc_pid:
+            maps = dev.root_shell(
+                f"grep -i hyperceiler /proc/{sc_pid[0]}/maps || true", check=False
+            )
+            if "com.sevtinge.hyperceiler" in maps:
+                print(
+                    f"  [OK] HyperCeiler actively hooked in com.miui.securitycenter (PID {sc_pid[0]})"
+                )
+            else:
+                failures.append(
+                    f"HyperCeiler not mapped in com.miui.securitycenter (PID {sc_pid[0]})"
+                )
+
+        # 7. Check XMSF surveillance components disabled & /data/system package history scrubbed
+        xmsf_dump = dev.root_shell("dumpsys package com.xiaomi.xmsf")
+        xmsf_disabled = ""
+        if "disabledComponents:" in xmsf_dump:
+            xmsf_disabled = xmsf_dump.split("disabledComponents:", 1)[1].split(
+                "enabledComponents:", 1
+            )[0]
+        missing_xmsf = [
+            comp.split("/", 1)[1]
+            for comp in XMSF_DISABLED_COMPONENTS
+            if comp.split("/", 1)[1] not in xmsf_disabled
+        ]
+        if missing_xmsf:
+            failures.append(f"XMSF tracking components not disabled: {', '.join(missing_xmsf)}")
+        else:
+            print(
+                f"  [OK] XMSF internal tracking/log-upload components ({len(XMSF_DISABLED_COMPONENTS)}) disabled"
+            )
+
+        sys_leaks = dev.root_shell(
+            f"grep -iE '{SENSITIVE_LOG_REGEX}' /data/system/pkg_history.txt /data/system/package-event/* 2>/dev/null | wc -l",
+            check=False,
+        ).strip()
+        if sys_leaks != "0":
+            failures.append(f"/data/system package logs still contain {sys_leaks} sensitive entries")
+        else:
+            print("  [OK] /data/system/pkg_history.txt and package-event logs clean")
+
+        # 8. Check Hide My Applist (HMA) templates and domestic app scopes
+        misc_dir = dev.root_shell(
+            "ls -d /data/misc/hide_my_applist_* 2>/dev/null | head -n1", check=False
+        ).strip()
+        if misc_dir:
+            raw_cfg = dev.root_shell(f"cat {misc_dir}/config.json", check=False)
+            if raw_cfg.startswith("{"):
+                cfg = json.loads(raw_cfg)
+                tmpls = cfg.get("templates", {})
+                scope = cfg.get("scope", {})
+                installed_3p = set(
+                    line.removeprefix("package:").strip()
+                    for line in dev.shell("pm list packages -3").splitlines()
+                    if line.startswith("package:")
+                )
+                unscoped = [
+                    pkg
+                    for pkg in DOMESTIC_SCOPED_APPS
+                    if pkg in installed_3p and pkg not in scope
+                ]
+                if "hide root" not in tmpls or "hide sensitive" not in tmpls or unscoped:
+                    failures.append(
+                        f"HMA config incomplete (templates={list(tmpls.keys())}, unscoped_domestic={unscoped})"
+                    )
+                else:
+                    print(
+                        f"  [OK] Hide My Applist (HMA) active with 'hide root' ({len(tmpls['hide root'].get('appList', []))}) + 'hide sensitive' ({len(tmpls['hide sensitive'].get('appList', []))}) across {len(scope)} scoped apps"
+                    )
+    else:
+        print(
+            "  [INFO] Root(Shell) is disabled; skipped root-only component/XML/maps checks"
+        )
+
+    if failures:
+        for f in failures:
+            print(f"  [FAIL] {f}")
+        return False
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Audit or apply HyperOS privacy cleanup and HyperCeiler protection."
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        default="check",
+        choices=("check", "apply"),
+        help="action to run: 'check' (default, read-only) or 'apply' (requires Root)",
+    )
+    parser.add_argument("-s", "--serial", help="target ADB device serial")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="operate on all connected ADB devices",
+    )
+    parser.add_argument(
+        "--backup-dir",
+        type=Path,
+        help="optional directory to store baseline backups before 'apply'",
+    )
+    parser.add_argument(
+        "--whitelist",
+        action="append",
+        default=[],
+        help="additional package name to add to SecurityCenter key_white_list_app",
+    )
+    args = parser.parse_args()
+
+    devices = resolve_devices(args.serial, args.all)
+    all_ok = True
+    for dev in devices:
+        if args.action == "apply":
+            apply_device(dev, args.backup_dir, args.whitelist)
+        ok = check_device(dev)
+        all_ok = all_ok and ok
+    return 0 if all_ok else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        sys.exit(130)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as err:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,159 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["qrcode==8.2"]
+# ///
+"""Terminal QR pairing using Android's standard ADB Wi-Fi protocol."""
+
+import argparse
+import fcntl
+import re
+import secrets
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+import qrcode
+
+
+def adb(*args, timeout=10, input=None):
+    result = subprocess.run(
+        ["adb", *args], input=input, capture_output=True, text=True, timeout=timeout
+    )
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode:
+        raise RuntimeError(output or f"adb {args[0]} failed")
+    return output
+
+
+def probe_mdns():
+    # Send a unicast-response (QU) mDNS query on default LAN interfaces so
+    # phones reply directly to port 5353 even when TUN routes hijack multicast.
+    try:
+        with open("/proc/net/route") as route_file:
+            ifaces = {
+                fields[0]
+                for line in route_file.read().splitlines()[1:]
+                if len(fields := line.split()) > 1 and fields[1] == "00000000"
+            }
+        for iface in ifaces:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                addr = fcntl.ioctl(sock, 0x8915, struct.pack("256s", iface[:15].encode()))[20:24]
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, addr)
+                sock.bind(("", 5353))
+                for qname in (
+                    b"\x10_adb-tls-pairing\x04_tcp\x05local\x00",
+                    b"\x10_adb-tls-connect\x04_tcp\x05local\x00",
+                ):
+                    query = struct.pack("!HHHHHH", 0, 0, 1, 0, 0, 0) + qname + struct.pack("!HH", 12, 0x8001)
+                    sock.sendto(query, ("224.0.0.251", 5353))
+        time.sleep(0.1)
+    except OSError:
+        pass
+
+
+def services():
+    probe_mdns()
+    found = []
+    for line in adb("mdns", "services").splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[1].startswith("_adb-"):
+            found.append(tuple(fields))
+    return found
+
+
+def verify_connection(guid):
+    # Use the same transport name as ADB's pairing-triggered auto-connect.
+    target = f"{guid}._adb-tls-connect._tcp"
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        connected = {}
+        for line in adb("devices").splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1] == "device":
+                connected[fields[0].rstrip(".")] = fields[0]
+        selected = connected.get(target)
+        if not selected:
+            for service, kind, address in services():
+                if service.strip('"') != guid or kind.rstrip(".") != "_adb-tls-connect._tcp":
+                    continue
+                # Reuse an existing IP connection too, but never create one.
+                selected = connected.get(address)
+                if not selected:
+                    adb("connect", target)
+                break
+        if selected:
+            if adb("-s", selected, "get-state") == "device":
+                model = adb("-s", selected, "shell", "getprop", "ro.product.model")
+                print(f"Wireless ADB verified: {model} ({selected})")
+                return 0
+        time.sleep(1)
+    raise RuntimeError("Paired successfully, but the connection was not verified. Run adb devices -l to check.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Show a QR code, then pair and verify wireless ADB automatically.")
+    parser.add_argument("--timeout", type=int, default=180, help="seconds to wait for a scan (default: 180)")
+    args = parser.parse_args()
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than 0")
+    if not shutil.which("adb"):
+        raise RuntimeError("adb not found. Add it to your PATH first.")
+    adb("start-server")
+    name = "studio-" + secrets.token_hex(5)
+    password = secrets.token_hex(10)
+    qr = qrcode.QRCode(border=4)
+    qr.add_data(f"WIFI:T:ADB;S:{name};P:{password};;")
+    qr.make(fit=True)
+    if shutil.get_terminal_size().columns < qr.modules_count + 8:
+        raise RuntimeError("Terminal too narrow. Widen the window and try again.")
+    print("On your phone: Developer options → Wireless debugging → Pair device with QR code")
+    print("Scan the QR code below (not with the regular camera app or WeChat).")
+    qr.print_ascii(tty=sys.stdout.isatty(), invert=True)
+    print(f"Waiting for a scan (timeout: {args.timeout}s). Press Ctrl+C to cancel.", flush=True)
+    deadline = time.monotonic() + args.timeout
+    endpoint = None
+    secret = password
+    while time.monotonic() < deadline:
+        for service, kind, address in services():
+            if kind.rstrip(".") != "_adb-tls-pairing._tcp":
+                continue
+            if service == name:
+                endpoint = address
+                break
+            if service == f'"{name}"':
+                # Android 15 WifiUriParser wraps both SSID and preSharedKey in quotes.
+                endpoint = address
+                secret = f'"{password}"'
+                break
+        if endpoint:
+            break
+        time.sleep(1)
+    if not endpoint:
+        raise RuntimeError("Pairing service not found. Check that both devices are on the same Wi-Fi, wireless debugging is enabled, and you used its QR scanner.")
+    print(f"Found phone at {endpoint}. Pairing...", flush=True)
+    # Send the secret on stdin rather than exposing it in process arguments.
+    output = adb("pair", endpoint, input=secret + "\n", timeout=30)
+    if "Successfully paired" not in output:
+        raise RuntimeError(f"Pairing failed: {output}")
+    match = re.search(r"\[guid=([^\]\s]+)\]", output)
+    if not match:
+        raise RuntimeError("Paired successfully, but ADB did not return a device GUID. Run adb devices -l to check.")
+    print("Paired successfully. Checking the device connection...", flush=True)
+    return verify_connection(match.group(1))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        print(f"\nError: {error}", file=sys.stderr)
+        sys.exit(1)
