@@ -1,0 +1,10 @@
+# Core packages for /data/adb/tricky_store/target.txt (TEESimulator-RS / TrickyStore).
+# Suffix `!` enables certificate-generating mode for Play Integrity / GMS attestation.
+com.google.android.gms!
+com.android.vending!
+com.google.android.gsf!
+gr.nikolasspyr.integritycheck!
+
+# Add additional apps (banking, wallet, payment, root-sensitive apps) below without `!` as needed:
+# com.google.android.apps.walletnfcrel
+# com.paypal.android.p2pmobile

@@ -1,0 +1,16 @@
+# Sanitized baseline for /data/adb/pif.prop (PlayIntegrityFix v4.9-inject-s+).
+# Refresh FINGERPRINT/MODEL/SECURITY_PATCH/DEVICE_INITIAL_SDK_INT via:
+#   sh /data/adb/modules/playintegrityfix/autopif.sh
+# Keep spoofBuild=true, spoofProps=true, and spoofVendingBuild=true.
+FINGERPRINT=google/<product>_beta/<device>:CANARY/<build_id>/<incremental>:user/release-keys
+MANUFACTURER=Google
+MODEL=<Pixel Canary Model>
+SECURITY_PATCH=YYYY-MM-DD
+DEVICE_INITIAL_SDK_INT=33
+spoofBuild=true
+spoofProps=true
+spoofProvider=false
+spoofSignature=false
+spoofVendingBuild=true
+spoofVendingSdk=false
+DEBUG=false

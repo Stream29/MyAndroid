@@ -1,0 +1,5 @@
+# Must match SECURITY_PATCH in /data/adb/pif.prop and /data/adb/modules/playintegrityfix/system.prop.
+# Automatically updated by security_patch.sh when /data/adb/tricky_store/pif_auto_security_patch exists.
+system=YYYYMM
+boot=YYYY-MM-DD
+vendor=YYYY-MM-DD

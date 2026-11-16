@@ -1,0 +1,842 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""Audit, deploy, sync, and back up Android Play Integrity / TEESimulator-RS spoofing state over ADB + Root."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Sequence
+import xml.etree.ElementTree as ET
+
+CORE_BANG_PACKAGES: tuple[str, ...] = (
+    "com.google.android.gms",
+    "com.android.vending",
+    "com.google.android.gsf",
+)
+CHECKER_PACKAGE = "gr.nikolasspyr.integritycheck"
+REQUIRED_PIF_TRUE_FLAGS: tuple[str, ...] = (
+    "spoofBuild",
+    "spoofProps",
+    "spoofVendingBuild",
+)
+TARGET_MOD_TRICKY = "/data/adb/modules/tricky_store"
+TARGET_DATA_TRICKY = "/data/adb/tricky_store"
+TARGET_MOD_PIF = "/data/adb/modules/playintegrityfix"
+TARGET_DATA_PIF = "/data/adb/pif.prop"
+TARGET_HMA_CONFIG = "/data/data/org.frknkrc44.hma_oss/files/config.json"
+TARGET_LSPD_DB = "/data/adb/lspd/config/modules_config.db"
+TARGET_HYPERCEILER_PREFS = "/data/user_de/0/com.sevtinge.hyperceiler/shared_prefs/hyperceiler_prefs.xml"
+TARGET_KSU_ALLOWLIST = "/data/adb/ksu/.allowlist"
+
+GMS_RESTART_PACKAGES: tuple[str, ...] = (
+    "com.google.android.gms",
+    "com.google.android.gms.unstable",
+    "com.android.vending",
+    CHECKER_PACKAGE,
+)
+
+
+@dataclass(frozen=True)
+class KeyboxReport:
+    device_id: str
+    algorithms: tuple[str, ...]
+    cert_count: int
+    expired_certs: tuple[str, ...]
+    not_yet_valid_certs: tuple[str, ...]
+    latest_not_after: str | None
+
+
+@dataclass(frozen=True)
+class DeviceSnapshot:
+    serial: str
+    marketname: str
+    model: str
+    device: str
+    android_release: str
+    sdk_int: str
+    incremental: str
+    verified_boot_state: str
+    flash_locked: str
+    vbmeta_state: str
+    live_security_patch: str
+    live_vendor_patch: str
+    modules: dict[str, dict[str, str]] = field(default_factory=dict)
+    tricky_module_files: tuple[str, ...] = ()
+    running_daemons: str = ""
+    data_pif_text: str = ""
+    module_pif_text: str = ""
+    pif_system_prop_text: str = ""
+    has_auto_security_patch: bool = False
+    security_patch_txt: str = ""
+    keybox_xml: str = ""
+    hbk_size: int = 0
+    boot_hash_size: int = 0
+    boot_key_size: int = 0
+    tee_status: str = ""
+    target_txt: str = ""
+    checker_installed: bool = False
+    gms_version: str = ""
+    vending_version: str = ""
+    certgen_tail: str = ""
+
+
+class AdbDevice:
+    """Thin ADB + KernelSU root command wrapper for one Android device."""
+
+    def __init__(self, serial: str) -> None:
+        self.serial = serial
+
+    def _run(self, *args: str, timeout: int = 20, check: bool = True, binary: bool = False) -> subprocess.CompletedProcess:
+        cmd = ["adb", "-s", self.serial, *args]
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=not binary,
+            timeout=timeout,
+        )
+        if check and proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", "replace") if binary else proc.stderr
+            raise RuntimeError(f"adb {' '.join(args)} failed on {self.serial}: {stderr.strip()}")
+        return proc
+
+    def shell(self, script: str, *, check: bool = True, timeout: int = 20) -> str:
+        proc = self._run("shell", script, timeout=timeout, check=check)
+        return proc.stdout.strip()
+
+    def root_shell(self, script: str, *, check: bool = True, timeout: int = 20) -> str:
+        quoted = shlex.quote(script)
+        return self.shell(f"su -c {quoted}", check=check, timeout=timeout)
+
+    def pull_root_bytes(self, remote_path: str, *, timeout: int = 20) -> bytes | None:
+        proc = self._run(
+            "exec-out",
+            "su",
+            "-c",
+            f"test -f {shlex.quote(remote_path)} && cat {shlex.quote(remote_path)}",
+            timeout=timeout,
+            check=False,
+            binary=True,
+        )
+        if proc.returncode != 0:
+            return None
+        return proc.stdout
+
+    def push_root_bytes(self, data: bytes, remote_path: str, mode: str = "0644") -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_tmp = Path(tmpdir) / "payload"
+            local_tmp.write_bytes(data)
+            local_tmp.chmod(0o600)
+            remote_tmp = f"/data/local/tmp/pi_{Path(remote_path).name}"
+            self._run("push", str(local_tmp), remote_tmp, timeout=30)
+            self.root_shell(
+                f"mkdir -p {shlex.quote(str(Path(remote_path).parent))} && "
+                f"cp {shlex.quote(remote_tmp)} {shlex.quote(remote_path)} && "
+                f"chmod {mode} {shlex.quote(remote_path)} && "
+                f"rm -f {shlex.quote(remote_tmp)}"
+            )
+
+
+def resolve_devices(serial: str | None, all_devices: bool) -> list[AdbDevice]:
+    if not shutil.which("adb"):
+        raise RuntimeError("adb not found in PATH.")
+    proc = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10, check=True)
+    online: list[str] = []
+    for line in proc.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            online.append(parts[0])
+    if serial:
+        if serial not in online:
+            raise RuntimeError(f"Device {serial!r} is not connected (online: {online}).")
+        return [AdbDevice(serial)]
+    if not online:
+        raise RuntimeError("No online ADB devices found.")
+    if all_devices:
+        return [AdbDevice(s) for s in online]
+    if len(online) > 1:
+        raise RuntimeError(f"Multiple ADB devices connected {online}; specify -s/--serial or --all.")
+    return [AdbDevice(online[0])]
+
+
+def parse_kv_lines(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        values[key.strip()] = val.strip()
+    return values
+
+
+def normalize_short_patch(patch_date: str) -> str:
+    match = re.fullmatch(r"(\d{4})-(\d{2})-\d{2}", patch_date.strip())
+    if not match:
+        return ""
+    return f"{match.group(1)}{match.group(2)}"
+
+
+def _parse_openssl_date(raw_value: str) -> datetime:
+    cleaned = re.sub(r"\s+", " ", raw_value.strip())
+    for fmt in ("%b %d %H:%M:%S %Y %Z", "%b %d %H:%M:%S %Y"):
+        try:
+            dt = datetime.strptime(cleaned, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized OpenSSL date format: {raw_value!r}")
+
+
+def validate_keybox_xml(xml_text: str, *, now: datetime | None = None) -> KeyboxReport:
+    """Validate keybox XML structure and certificate dates without logging key material."""
+    if not xml_text.strip():
+        raise ValueError("keybox.xml is empty")
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as err:
+        raise ValueError(f"keybox.xml XML parse error: {err}") from err
+
+    keybox_node = root.find(".//Keybox")
+    device_id = keybox_node.attrib.get("DeviceID", "unknown") if keybox_node is not None else "unknown"
+    keys = root.findall(".//Key")
+    if not keys:
+        raise ValueError("keybox.xml contains no <Key> entries")
+
+    algorithms = tuple(k.attrib.get("algorithm", "unknown") for k in keys)
+    certs = root.findall(".//Certificate")
+    if len(certs) < 2:
+        raise ValueError(f"keybox.xml expected >=2 certificates in chain, found {len(certs)}")
+
+    if not shutil.which("openssl"):
+        raise RuntimeError("openssl not found in PATH (required for certificate date verification)")
+
+    ref_now = now or datetime.now(timezone.utc)
+    expired: list[str] = []
+    not_yet_valid: list[str] = []
+    latest_after: datetime | None = None
+
+    for idx, cert in enumerate(certs):
+        pem_lines = [line.strip() for line in (cert.text or "").splitlines() if line.strip()]
+        pem = "\n".join(pem_lines) + "\n"
+        proc = subprocess.run(
+            ["openssl", "x509", "-noout", "-dates", "-subject"],
+            input=pem,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            raise ValueError(f"Certificate #{idx} is invalid X.509 PEM: {proc.stderr.strip()}")
+        meta = parse_kv_lines(proc.stdout)
+        nb = _parse_openssl_date(meta["notBefore"])
+        na = _parse_openssl_date(meta["notAfter"])
+        subj = meta.get("subject", f"cert#{idx}")
+        if ref_now < nb:
+            not_yet_valid.append(f"cert#{idx} ({subj}, notBefore={meta['notBefore']})")
+        if ref_now > na:
+            expired.append(f"cert#{idx} ({subj}, notAfter={meta['notAfter']})")
+        if latest_after is None or na > latest_after:
+            latest_after = na
+
+    return KeyboxReport(
+        device_id=device_id,
+        algorithms=algorithms,
+        cert_count=len(certs),
+        expired_certs=tuple(expired),
+        not_yet_valid_certs=tuple(not_yet_valid),
+        latest_not_after=latest_after.strftime("%Y-%m-%d") if latest_after else None,
+    )
+
+
+def patch_pif_flags(text: str, overrides: dict[str, str]) -> str:
+    """Update or append key=value flags in pif.prop while keeping line order."""
+    remaining = dict(overrides)
+    updated: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key, _ = stripped.split("=", 1)
+            key = key.strip()
+            if key in remaining:
+                updated.append(f"{key}={remaining.pop(key)}")
+                continue
+        updated.append(raw)
+    for key, val in remaining.items():
+        updated.append(f"{key}={val}")
+    return "\n".join(updated) + "\n"
+
+
+def normalize_target_lines(
+    lines: Sequence[str],
+    required_bang: Sequence[str] = CORE_BANG_PACKAGES,
+    optional_bang: Sequence[str] = (),
+) -> tuple[list[str], list[str]]:
+    """Ensure target packages have `!` cert-generation suffix without dropping user packages."""
+    changes: list[str] = []
+    bang_targets = set(required_bang) | set(optional_bang)
+    seen_clean: set[str] = set()
+    result: list[str] = []
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            result.append(raw.rstrip("\r\n"))
+            continue
+        pkg = line.rstrip("!")
+        if pkg in bang_targets:
+            desired = f"{pkg}!"
+            if desired in seen_clean:
+                changes.append(f"deduplicated {line}")
+                continue
+            if line != desired:
+                changes.append(f"upgraded {line} -> {desired}")
+            result.append(desired)
+            seen_clean.add(desired)
+        else:
+            if line in seen_clean:
+                changes.append(f"deduplicated {line}")
+                continue
+            result.append(line)
+            seen_clean.add(line)
+
+    for pkg in (*required_bang, *optional_bang):
+        desired = f"{pkg}!"
+        if desired not in seen_clean:
+            result.append(desired)
+            seen_clean.add(desired)
+            changes.append(f"added {desired}")
+
+    return result, changes
+
+
+def evaluate_device_snapshot(
+    snap: DeviceSnapshot,
+    *,
+    now: datetime | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Evaluate collected device snapshot into (ok, warn, fail) diagnostic lines."""
+    ok: list[str] = []
+    warn: list[str] = []
+    fail: list[str] = []
+
+    # 1. Core KernelSU modules
+    required_mods = ("hybrid_mount", "zygisksu", "playintegrityfix", "tricky_store")
+    for mod_id in required_mods:
+        info = snap.modules.get(mod_id)
+        if not info:
+            fail.append(f"KernelSU module '{mod_id}' is missing")
+        elif info.get("enabled") != "true":
+            fail.append(f"KernelSU module '{mod_id}' is disabled")
+        else:
+            ok.append(f"Module {mod_id} enabled ({info.get('name', mod_id)} {info.get('version', '?')})")
+
+    if "hma_oss_zygisk" in snap.modules:
+        info = snap.modules["hma_oss_zygisk"]
+        if info.get("enabled") == "true":
+            ok.append(f"Module hma_oss_zygisk enabled ({info.get('version', '?')})")
+        else:
+            warn.append("Module hma_oss_zygisk is installed but disabled")
+    else:
+        warn.append("Module hma_oss_zygisk not found (root-hiding list may be inactive)")
+
+    # 2. TEESimulator-RS vs legacy service.apk architecture check
+    files_set = set(snap.tricky_module_files)
+    if "service.apk" in files_set and "libTEESimulator.so" not in files_set:
+        fail.append(
+            "Legacy TrickyStore (service.apk) detected; fails against GMS 26.44.32+. Replace with TEESimulator-RS (supervisor + libTEESimulator.so + libcertgen.so)."
+        )
+    elif {"supervisor", "libTEESimulator.so", "libcertgen.so"}.issubset(files_set):
+        ok.append("TrickyStore module uses native TEESimulator-RS architecture (supervisor + libTEESimulator.so + libcertgen.so)")
+    elif files_set:
+        warn.append(f"Unexpected tricky_store module layout: {sorted(files_set)}")
+
+    if "TEESimulator" in snap.running_daemons or "supervisor" in snap.running_daemons:
+        ok.append("TEESimulator / supervisor daemon process is running")
+    else:
+        fail.append("TEESimulator / supervisor daemon process is NOT running")
+
+    # 3. PIF configuration
+    active_pif_src = TARGET_DATA_PIF if snap.data_pif_text.strip() else f"{TARGET_MOD_PIF}/pif.prop"
+    active_pif_text = snap.data_pif_text if snap.data_pif_text.strip() else snap.module_pif_text
+    pif = parse_kv_lines(active_pif_text)
+    if not pif:
+        fail.append("No pif.prop found in /data/adb/pif.prop or module directory")
+    else:
+        fp = pif.get("FINGERPRINT", "")
+        patch = pif.get("SECURITY_PATCH", "")
+        if not fp or not patch:
+            fail.append(f"Incomplete {active_pif_src} (missing FINGERPRINT or SECURITY_PATCH)")
+        else:
+            ok.append(
+                f"Active PIF ({active_pif_src}): {pif.get('MODEL', '?')} | SECURITY_PATCH={patch} | INITIAL_SDK={pif.get('DEVICE_INITIAL_SDK_INT', '?')}"
+            )
+        bad_flags = [flag for flag in REQUIRED_PIF_TRUE_FLAGS if pif.get(flag) != "true"]
+        if bad_flags:
+            details = ", ".join(f"{k}={pif.get(k, 'unset')}" for k in bad_flags)
+            fail.append(
+                f"PIF flags must be true in {active_pif_src}: {details} (spoofProps=false triggers UNEVALUATED)"
+            )
+        else:
+            ok.append("PIF required flags enabled (spoofBuild=true, spoofProps=true, spoofVendingBuild=true)")
+
+    # 4. Security patch alignment across PIF, tricky_store, system.prop, and live getprop
+    expected_patch = pif.get("SECURITY_PATCH", "")
+    expected_short = normalize_short_patch(expected_patch)
+    if snap.has_auto_security_patch:
+        ok.append("Auto security patch hook enabled (/data/adb/tricky_store/pif_auto_security_patch)")
+    else:
+        warn.append("Missing /data/adb/tricky_store/pif_auto_security_patch; autopif.sh will skip security_patch.sh")
+
+    sp_txt = parse_kv_lines(snap.security_patch_txt)
+    if expected_patch:
+        mismatches: list[str] = []
+        if sp_txt.get("boot") != expected_patch or sp_txt.get("vendor") != expected_patch:
+            mismatches.append(f"security_patch.txt(boot={sp_txt.get('boot')}, vendor={sp_txt.get('vendor')})")
+        if sp_txt.get("system") not in {expected_short, "prop"}:
+            mismatches.append(f"security_patch.txt(system={sp_txt.get('system')}, expected {expected_short})")
+
+        sys_prop = parse_kv_lines(snap.pif_system_prop_text)
+        if (
+            sys_prop.get("ro.build.version.security_patch") != expected_patch
+            or sys_prop.get("ro.vendor.build.security_patch") != expected_patch
+        ):
+            mismatches.append(
+                f"system.prop({sys_prop.get('ro.build.version.security_patch')}/{sys_prop.get('ro.vendor.build.security_patch')})"
+            )
+
+        if snap.live_security_patch != expected_patch or snap.live_vendor_patch != expected_patch:
+            mismatches.append(f"live getprop({snap.live_security_patch}/{snap.live_vendor_patch})")
+
+        if mismatches:
+            fail.append(f"Security patch mismatch vs PIF ({expected_patch}): {'; '.join(mismatches)}")
+        else:
+            ok.append(f"Security patch aligned across PIF, security_patch.txt, system.prop, and getprop ({expected_patch})")
+
+    # 5. Keybox & companion attestation artifacts
+    if not snap.keybox_xml.strip():
+        fail.append("Missing /data/adb/tricky_store/keybox.xml")
+    else:
+        try:
+            kb = validate_keybox_xml(snap.keybox_xml, now=now)
+            if kb.expired_certs or kb.not_yet_valid_certs:
+                fail.append(
+                    f"keybox.xml has invalid certificate window: expired={list(kb.expired_certs)}, future={list(kb.not_yet_valid_certs)}"
+                )
+            else:
+                ok.append(
+                    f"keybox.xml valid (DeviceID={kb.device_id}, algs={','.join(kb.algorithms)}, certs={kb.cert_count}, latest_notAfter={kb.latest_not_after})"
+                )
+        except (ValueError, RuntimeError) as err:
+            fail.append(f"keybox.xml validation failed: {err}")
+
+    if snap.hbk_size > 0:
+        ok.append(f"Companion hbk present ({snap.hbk_size} bytes)")
+    else:
+        warn.append("Missing /data/adb/tricky_store/hbk (needed alongside keybox on some TEESimulator-RS setups)")
+
+    if snap.tee_status:
+        ok.append(f"tee_status: {snap.tee_status.strip()}")
+
+    # 6. target.txt check
+    target_lines = {line.strip() for line in snap.target_txt.splitlines() if line.strip() and not line.strip().startswith("#")}
+    expected_targets = list(CORE_BANG_PACKAGES)
+    if snap.checker_installed:
+        expected_targets.append(CHECKER_PACKAGE)
+    missing_bang = [pkg for pkg in expected_targets if f"{pkg}!" not in target_lines]
+    if missing_bang:
+        fail.append(
+            f"target.txt missing '!' cert-gen entries for: {', '.join(missing_bang)}"
+        )
+    else:
+        ok.append(f"target.txt includes '!' cert-gen entries for core Google/checker packages ({len(target_lines)} entries total)")
+
+    # 7. Bootloader spoofing props
+    if snap.verified_boot_state == "green" and snap.flash_locked == "1" and snap.vbmeta_state == "locked":
+        ok.append("Boot properties spoofed cleanly (verifiedbootstate=green, flash.locked=1, vbmeta=locked)")
+    else:
+        warn.append(
+            f"Boot properties not fully spoofed (verifiedbootstate={snap.verified_boot_state}, flash.locked={snap.flash_locked}, vbmeta={snap.vbmeta_state})"
+        )
+
+    return ok, warn, fail
+
+
+def collect_snapshot(dev: AdbDevice) -> DeviceSnapshot:
+    props_raw = dev.shell(
+        "\n".join(
+            [
+                "echo marketname=$(getprop ro.product.marketname)",
+                "echo model=$(getprop ro.product.model)",
+                "echo device=$(getprop ro.product.device)",
+                "echo release=$(getprop ro.build.version.release)",
+                "echo sdk=$(getprop ro.build.version.sdk)",
+                "echo incremental=$(getprop ro.build.version.incremental)",
+                "echo verified=$(getprop ro.boot.verifiedbootstate)",
+                "echo locked=$(getprop ro.boot.flash.locked)",
+                "echo vbmeta=$(getprop ro.boot.vbmeta.device_state)",
+                "echo patch=$(getprop ro.build.version.security_patch)",
+                "echo vpatch=$(getprop ro.vendor.build.security_patch)",
+                f"pm path {CHECKER_PACKAGE} >/dev/null 2>&1 && echo checker=1 || echo checker=0",
+                "echo gms=$(dumpsys package com.google.android.gms | grep -m1 versionName= | sed 's/.*versionName=//')",
+                "echo vending=$(dumpsys package com.android.vending | grep -m1 versionName= | sed 's/.*versionName=//')",
+            ]
+        )
+    )
+    props = parse_kv_lines(props_raw)
+
+    mods_raw = dev.root_shell("ksud module list", check=False)
+    modules: dict[str, dict[str, str]] = {}
+    if mods_raw.startswith("["):
+        for item in json.loads(mods_raw):
+            if "id" in item:
+                modules[item["id"]] = item
+
+    root_script = "\n".join(
+        [
+            f"echo '===TRICKY_FILES==='; ls -1 {TARGET_MOD_TRICKY} 2>/dev/null || true",
+            "echo '===DAEMONS==='; ps -ef | grep -E 'TEESimulator|supervisor|TrickyStore|zn-daemon' | grep -v grep || true",
+            f"echo '===AUTO_PATCH==='; test -e {TARGET_DATA_TRICKY}/pif_auto_security_patch && echo 1 || echo 0",
+            f"echo '===HBK_SIZE==='; wc -c < {TARGET_DATA_TRICKY}/hbk 2>/dev/null || echo 0",
+            f"echo '===BHASH_SIZE==='; wc -c < {TARGET_DATA_TRICKY}/boot_hash.bin 2>/dev/null || echo 0",
+            f"echo '===BKEY_SIZE==='; wc -c < {TARGET_DATA_TRICKY}/boot_key.bin 2>/dev/null || echo 0",
+            f"echo '===TEE_STATUS==='; cat {TARGET_DATA_TRICKY}/tee_status 2>/dev/null || true; echo ''",
+            f"echo '===CERTGEN_TAIL==='; tail -n 5 {TARGET_DATA_TRICKY}/logs/certgen.log 2>/dev/null || true",
+        ]
+    )
+    sections_raw = dev.root_shell(root_script, check=False)
+    sections: dict[str, str] = {}
+    current = ""
+    buf: list[str] = []
+    for line in sections_raw.splitlines():
+        if line.startswith("===") and line.endswith("==="):
+            if current:
+                sections[current] = "\n".join(buf).strip()
+            current = line.strip("=")
+            buf = []
+        else:
+            buf.append(line)
+    if current:
+        sections[current] = "\n".join(buf).strip()
+
+    def _read_text(path: str) -> str:
+        raw = dev.pull_root_bytes(path)
+        return raw.decode("utf-8", "replace") if raw is not None else ""
+
+    return DeviceSnapshot(
+        serial=dev.serial,
+        marketname=props.get("marketname", ""),
+        model=props.get("model", ""),
+        device=props.get("device", ""),
+        android_release=props.get("release", ""),
+        sdk_int=props.get("sdk", ""),
+        incremental=props.get("incremental", ""),
+        verified_boot_state=props.get("verified", ""),
+        flash_locked=props.get("locked", ""),
+        vbmeta_state=props.get("vbmeta", ""),
+        live_security_patch=props.get("patch", ""),
+        live_vendor_patch=props.get("vpatch", ""),
+        modules=modules,
+        tricky_module_files=tuple(x.strip() for x in sections.get("TRICKY_FILES", "").splitlines() if x.strip()),
+        running_daemons=sections.get("DAEMONS", ""),
+        data_pif_text=_read_text(TARGET_DATA_PIF),
+        module_pif_text=_read_text(f"{TARGET_MOD_PIF}/pif.prop"),
+        pif_system_prop_text=_read_text(f"{TARGET_MOD_PIF}/system.prop"),
+        has_auto_security_patch=sections.get("AUTO_PATCH", "") == "1",
+        security_patch_txt=_read_text(f"{TARGET_DATA_TRICKY}/security_patch.txt"),
+        keybox_xml=_read_text(f"{TARGET_DATA_TRICKY}/keybox.xml"),
+        hbk_size=int(sections.get("HBK_SIZE", "0") or 0),
+        boot_hash_size=int(sections.get("BHASH_SIZE", "0") or 0),
+        boot_key_size=int(sections.get("BKEY_SIZE", "0") or 0),
+        tee_status=sections.get("TEE_STATUS", ""),
+        target_txt=_read_text(f"{TARGET_DATA_TRICKY}/target.txt"),
+        checker_installed=props.get("checker") == "1",
+        gms_version=props.get("gms", ""),
+        vending_version=props.get("vending", ""),
+        certgen_tail=sections.get("CERTGEN_TAIL", ""),
+    )
+
+
+def default_repo_secret_root() -> Path | None:
+    """Locate sibling DeviceManagement/secret when running from DeviceManagement/MyAndroid/bin."""
+    candidate = Path(__file__).resolve().parents[2] / "secret"
+    return candidate if candidate.is_dir() else None
+
+
+def restart_attestation_stack(dev: AdbDevice, *, clear_cache: bool = True) -> None:
+    cmds = []
+    if clear_cache:
+        cmds.extend(
+            [
+                f"mkdir -p {TARGET_DATA_TRICKY}/persistent_keys {TARGET_DATA_TRICKY}/key_db",
+                f"rm -rf {TARGET_DATA_TRICKY}/persistent_keys/* {TARGET_DATA_TRICKY}/key_db/*",
+            ]
+        )
+    cmds.extend(
+        [
+            "killall daemon supervisor 2>/dev/null || true",
+            "pkill -f TrickyStore 2>/dev/null || true",
+            f"nohup sh {TARGET_MOD_TRICKY}/service.sh >/dev/null 2>&1 &",
+            *(f"am force-stop {pkg}" for pkg in GMS_RESTART_PACKAGES),
+        ]
+    )
+    dev.root_shell("\n".join(cmds))
+
+
+def cmd_check(devices: list[AdbDevice]) -> int:
+    all_ok = True
+    for dev in devices:
+        snap = collect_snapshot(dev)
+        print(
+            f"=== {snap.marketname or snap.model} ({snap.device} | {snap.serial}) "
+            f"Android {snap.android_release} SDK {snap.sdk_int} ({snap.incremental}) ==="
+        )
+        print(f"  [INFO] GMS={snap.gms_version or '?'} | PlayStore={snap.vending_version or '?'}")
+        ok, warn, fail = evaluate_device_snapshot(snap)
+        for line in ok:
+            print(f"  [OK] {line}")
+        for line in warn:
+            print(f"  [WARN] {line}")
+        for line in fail:
+            print(f"  [FAIL] {line}")
+        if snap.certgen_tail:
+            last_line = snap.certgen_tail.splitlines()[-1]
+            print(f"  [INFO] certgen.log tail: {last_line}")
+        if int(snap.sdk_int or "0") <= 35:
+            print("  [INFO] Note: SDK <= 35 devices (e.g. marble) commonly reach MEETS_DEVICE_INTEGRITY rather than STRONG.")
+        if fail:
+            all_ok = False
+    return 0 if all_ok else 1
+
+
+def cmd_deploy_keybox(devices: list[AdbDevice], args: argparse.Namespace) -> int:
+    keybox_path = args.keybox
+    if keybox_path is None:
+        sec_root = default_repo_secret_root()
+        if sec_root and (sec_root / "keybox" / "keybox.xml").is_file():
+            keybox_path = sec_root / "keybox" / "keybox.xml"
+        else:
+            raise RuntimeError("No --keybox provided and default secret/keybox/keybox.xml was not found.")
+
+    xml_bytes = keybox_path.read_bytes()
+    report = validate_keybox_xml(xml_bytes.decode("utf-8", "replace"))
+    if report.expired_certs or report.not_yet_valid_certs:
+        raise RuntimeError(
+            f"Refusing to deploy invalid keybox {keybox_path}: expired={report.expired_certs}, future={report.not_yet_valid_certs}"
+        )
+
+    hbk_path: Path | None = None
+    if not args.no_hbk:
+        candidate = args.hbk or (keybox_path.parent / "hbk")
+        if candidate.is_file():
+            hbk_path = candidate
+
+    for dev in devices:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dev.root_shell(
+            f"test -f {TARGET_DATA_TRICKY}/keybox.xml && "
+            f"cp {TARGET_DATA_TRICKY}/keybox.xml {TARGET_DATA_TRICKY}/keybox.xml.bak_{ts} || true"
+        )
+        dev.push_root_bytes(xml_bytes, f"{TARGET_DATA_TRICKY}/keybox.xml", mode="0644")
+        if hbk_path is not None:
+            dev.push_root_bytes(hbk_path.read_bytes(), f"{TARGET_DATA_TRICKY}/hbk", mode="0644")
+        if not args.no_restart:
+            restart_attestation_stack(dev, clear_cache=True)
+        print(
+            f"[OK] Deployed keybox.xml (DeviceID={report.device_id}, valid until {report.latest_not_after})"
+            + (f" + hbk ({hbk_path.name})" if hbk_path else "")
+            + f" to {dev.serial}"
+        )
+    return 0
+
+
+def cmd_sync_pif(devices: list[AdbDevice], args: argparse.Namespace) -> int:
+    for dev in devices:
+        if args.pif:
+            raw_pif = args.pif.read_text(encoding="utf-8")
+            patched = patch_pif_flags(
+                raw_pif,
+                {"spoofBuild": "true", "spoofProps": "true", "spoofVendingBuild": "true"},
+            )
+            dev.push_root_bytes(patched.encode("utf-8"), TARGET_DATA_PIF, mode="0600")
+        else:
+            if not args.no_ota:
+                dev.root_shell(f"sh {TARGET_MOD_PIF}/autopif_ota.sh || true", timeout=30)
+            dev.root_shell(f"sh {TARGET_MOD_PIF}/autopif.sh", timeout=60)
+            current = (dev.pull_root_bytes(TARGET_DATA_PIF) or b"").decode("utf-8", "replace")
+            patched = patch_pif_flags(
+                current,
+                {"spoofBuild": "true", "spoofProps": "true", "spoofVendingBuild": "true"},
+            )
+            if patched != current:
+                dev.push_root_bytes(patched.encode("utf-8"), TARGET_DATA_PIF, mode="0600")
+
+        if args.sync_module_pif:
+            latest = dev.pull_root_bytes(TARGET_DATA_PIF) or b""
+            dev.push_root_bytes(latest, f"{TARGET_MOD_PIF}/pif.prop", mode="0644")
+
+        dev.root_shell(
+            f"touch {TARGET_DATA_TRICKY}/pif_auto_security_patch && "
+            f"sh {TARGET_MOD_PIF}/security_patch.sh && "
+            f"am force-stop com.google.android.gms.unstable && "
+            f"am force-stop com.android.vending && "
+            f"am force-stop {CHECKER_PACKAGE}"
+        )
+        print(f"[OK] Synced PIF + security_patch.txt + system.prop on {dev.serial}")
+    return 0
+
+
+def cmd_ensure_targets(devices: list[AdbDevice], args: argparse.Namespace) -> int:
+    for dev in devices:
+        raw = dev.pull_root_bytes(f"{TARGET_DATA_TRICKY}/target.txt") or b""
+        lines = raw.decode("utf-8", "replace").splitlines()
+        checker = dev.shell(f"pm path {CHECKER_PACKAGE} >/dev/null 2>&1 && echo 1 || echo 0") == "1"
+        optional = (CHECKER_PACKAGE,) if checker else ()
+        updated, changes = normalize_target_lines(lines, CORE_BANG_PACKAGES, optional)
+        if not changes:
+            print(f"[OK] target.txt already clean on {dev.serial}")
+            continue
+        if args.dry_run:
+            print(f"[DRY-RUN] {dev.serial} would change target.txt: {changes}")
+            continue
+        dev.push_root_bytes(("\n".join(updated) + "\n").encode("utf-8"), f"{TARGET_DATA_TRICKY}/target.txt", mode="0644")
+        print(f"[OK] Updated target.txt on {dev.serial}: {changes}")
+    return 0
+
+
+def cmd_restart(devices: list[AdbDevice]) -> int:
+    for dev in devices:
+        restart_attestation_stack(dev, clear_cache=True)
+        print(f"[OK] Cleared key caches, restarted TEESimulator-RS, and force-stopped GMS/Vending on {dev.serial}")
+    return 0
+
+
+def cmd_backup(devices: list[AdbDevice], args: argparse.Namespace) -> int:
+    for dev in devices:
+        device_codename = dev.shell("getprop ro.product.device") or dev.serial
+        if args.out_dir:
+            dest_dir = args.out_dir if len(devices) == 1 else (args.out_dir / device_codename)
+        else:
+            sec_root = default_repo_secret_root()
+            if not sec_root:
+                raise RuntimeError("Specify --out-dir when not running inside DeviceManagement/secret layout.")
+            dest_dir = sec_root / "android" / device_codename
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_dir.chmod(0o700)
+        if dest_dir.parent.name == "android":
+            dest_dir.parent.chmod(0o700)
+
+        artifacts: list[tuple[str, str]] = [
+            (f"{TARGET_DATA_TRICKY}/keybox.xml", "keybox.xml"),
+            (f"{TARGET_DATA_TRICKY}/hbk", "hbk"),
+            (f"{TARGET_DATA_TRICKY}/boot_hash.bin", "boot_hash.bin"),
+            (f"{TARGET_DATA_TRICKY}/boot_key.bin", "boot_key.bin"),
+            (TARGET_DATA_PIF, "pif.prop"),
+            (f"{TARGET_MOD_PIF}/pif.prop", "module-pif.prop"),
+            (f"{TARGET_MOD_PIF}/system.prop", "system.prop"),
+            (f"{TARGET_DATA_TRICKY}/security_patch.txt", "security_patch.txt"),
+            (f"{TARGET_DATA_TRICKY}/target.txt", "target.txt"),
+            (f"{TARGET_DATA_TRICKY}/tee_status", "tee_status"),
+        ]
+        if getattr(args, "include_hma", True):
+            artifacts.append((TARGET_HMA_CONFIG, "hma-config.json"))
+        if getattr(args, "include_root_configs", True):
+            artifacts.extend(
+                [
+                    (TARGET_LSPD_DB, "lspd-modules_config.db"),
+                    (TARGET_HYPERCEILER_PREFS, "hyperceiler_prefs.xml"),
+                    (TARGET_KSU_ALLOWLIST, "ksu-allowlist.bin"),
+                ]
+            )
+
+        saved: list[str] = []
+        for remote, local_name in artifacts:
+            data = dev.pull_root_bytes(remote)
+            if data is None:
+                continue
+            target_file = dest_dir / local_name
+            target_file.write_bytes(data)
+            target_file.chmod(0o600)
+            saved.append(local_name)
+        print(f"[OK] Backed up {len(saved)} files from {dev.serial} ({device_codename}) to {dest_dir} (0700/0600): {', '.join(saved)}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Audit, deploy, sync, and back up Play Integrity / TEESimulator-RS state."
+    )
+    parser.add_argument("-s", "--serial", help="target ADB device serial")
+    parser.add_argument("--all", action="store_true", help="operate on all connected ADB devices")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("check", help="read-only audit of PIF, TEESimulator-RS, keybox, security patch, and target.txt")
+
+    deploy = sub.add_parser("deploy-keybox", help="validate and push keybox.xml (+ optional hbk), clear caches, and restart")
+    deploy.add_argument("--keybox", type=Path, help="path to keybox.xml (defaults to ../../secret/keybox/keybox.xml if present)")
+    deploy.add_argument("--hbk", type=Path, help="optional path to hbk companion file")
+    deploy.add_argument("--no-hbk", action="store_true", help="do not push sibling hbk file")
+    deploy.add_argument("--no-restart", action="store_true", help="skip restarting TEESimulator-RS and GMS")
+
+    sync = sub.add_parser("sync-pif", help="refresh Pixel Canary fingerprint, enforce spoofProps=true, and align security_patch")
+    sync.add_argument("--pif", type=Path, help="push a local pif.prop instead of running autopif.sh")
+    sync.add_argument("--no-ota", action="store_true", help="skip autopif_ota.sh before autopif.sh")
+    sync.add_argument("--sync-module-pif", action="store_true", help="also copy /data/adb/pif.prop into module pif.prop")
+
+    targets = sub.add_parser("ensure-targets", help="ensure core Google packages have '!' suffix in target.txt")
+    targets.add_argument("--dry-run", action="store_true", help="show changes without writing to device")
+
+    sub.add_parser("restart", help="clear key caches, restart TEESimulator-RS, and force-stop GMS/Vending")
+
+    backup = sub.add_parser("backup", help="pull keybox and spoofing configs to a local 0700/0600 directory")
+    backup.add_argument("--out-dir", type=Path, help="output directory (defaults to ../../secret/android/<device>/)")
+    backup.add_argument("--no-hma", dest="include_hma", action="store_false", help="skip HMA-OSS config.json")
+    backup.add_argument("--no-root-configs", dest="include_root_configs", action="store_false", help="skip LSPosed, HyperCeiler, and KernelSU allowlist backups")
+    backup.set_defaults(include_hma=True, include_root_configs=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    command = args.command or "check"
+    devices = resolve_devices(args.serial, args.all)
+
+    if command == "check":
+        return cmd_check(devices)
+    if command == "deploy-keybox":
+        return cmd_deploy_keybox(devices, args)
+    if command == "sync-pif":
+        return cmd_sync_pif(devices, args)
+    if command == "ensure-targets":
+        return cmd_ensure_targets(devices, args)
+    if command == "restart":
+        return cmd_restart(devices)
+    if command == "backup":
+        return cmd_backup(devices, args)
+    parser.error(f"Unknown command: {command}")
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        sys.exit(130)
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as err:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)
