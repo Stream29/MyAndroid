@@ -13,6 +13,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -124,122 +125,25 @@ XMSF_OPTIONAL_DISABLED_COMPONENTS: tuple[str, ...] = (
     "com.xiaomi.xmsf/com.xiaomi.push.service.UploadLogSDKService",
 )
 
-SENSITIVE_LOG_REGEX = (
-    r"nagram|telegram|torproject|follow\.clash|kr328\.clash|bettbox|twitter\.android|"
-    r"nthlink|seagull|barcelona|t66y|lantern|psiphon|picacomic|copymanga|protonmail|"
-    r"sslcapture|kernelsu|lsposed|hyperceiler|hma_oss|fakeloc|gogogo|shizuku"
+DEFAULT_SENSITIVE_LOG_REGEX = (
+    r"kernelsu|lsposed|hyperceiler|hma_oss|shizuku|follow\.clash|bettbox"
 )
 
-HMA_HIDE_ROOT_LIST: tuple[str, ...] = (
+DEFAULT_HMA_HIDE_ROOT_LIST: tuple[str, ...] = (
     "me.weishu.kernelsu",
     "org.lsposed.manager",
     "com.sevtinge.hyperceiler",
     "org.frknkrc44.hma_oss",
     "moe.shizuku.privileged.api",
-    "com.rosan.installer.x",
-    "com.modify.installer",
-    "com.byyoung.setting",
-    "com.byyoung.miuisetting",
-    "com.byyoung.extract",
     "gr.nikolasspyr.integritycheck",
-    "com.zcshou.gogogo",
-    "io.github.auag0.hidemocklocation",
-    "com.lerist.fakelocation",
-    "io.github.cobylinweiqi.fakeloc",
-    "app.greyshirts.sslcapture",
-    "bin.mt.plus",
-    "bin.mt.termex",
-    "com.edwardgreve.ipakeyboard",
 )
 
-HMA_HIDE_SENSITIVE_LIST: tuple[str, ...] = (
+DEFAULT_HMA_HIDE_SENSITIVE_LIST: tuple[str, ...] = (
     "com.follow.clash",
     "com.appshub.bettbox",
-    "com.github.kr328.clash",
-    "org.torproject.torbrowser",
-    "com.nthlink.android.client",
-    "tool.seagull.v",
-    "com.psiphon3",
-    "org.getlantern.lantern",
-    "com.duckduckgo.mobile.android",
-    "com.saily.android",
-    "im.angry.easyeuicc",
-    "xyz.nextalone.nagram",
-    "org.telegram.messenger",
-    "com.twitter.android",
-    "com.instagram.barcelona",
-    "com.instagram.android",
-    "com.discord",
-    "com.reddit.frontpage",
-    "com.openai.chatgpt",
-    "com.google.android.apps.bard",
-    "ch.protonmail.android",
-    "com.cl.newt66y",
-    "com.picacomic.fregata",
-    "com.copymanga.app",
-    "com.maou.community",
-    "com.okinc.okex.gp",
-    "com.google.android.youtube",
-    "org.fdroid.fdroid",
-    "com.apkmirror.helper.prod",
-    "com.apkpure.aegon",
 )
 
-DOMESTIC_SCOPED_APPS: tuple[str, ...] = (
-    "cn.gov.tax.its",
-    "com.gov.cn",
-    "cn.com.chsi.chsiapp",
-    "cn.com.bmac.nfc",
-    "com.MobileTicket",
-    "com.chinamworld.main",
-    "com.icbc",
-    "cmb.pb",
-    "com.unionpay",
-    "com.greenpoint.android.mc10086.activity",
-    "com.hpbr.bosszhipin",
-    "com.beisen.italent",
-    "com.hose.ekuaibao",
-    "com.ss.android.lark",
-    "com.tencent.wemeet.app",
-    "com.tencent.mm",
-    "com.tencent.mobileqq",
-    "com.tencent.androidqqmail",
-    "com.eg.android.AlipayGphone",
-    "com.taobao.taobao",
-    "com.xunmeng.pinduoduo",
-    "com.sankuai.meituan",
-    "com.wudaokou.hippo",
-    "com.didi.es.psngr",
-    "com.autonavi.minimap",
-    "ctrip.android.view",
-    "com.htinns",
-    "com.anjuke.android.app",
-    "com.wiwj.xiangyucustomer",
-    "com.sz.yuanqu.health",
-    "com.wisedu.cpdaily",
-    "com.chaoxing.mobile",
-    "com.supwisdom.dq",
-    "tv.danmaku.bili",
-    "com.coolapk.market",
-    "com.netease.cloudmusic",
-    "com.netease.mail",
-    "com.netease.uu",
-    "cn.wps.moffice_eng.xiaomi.lite",
-    "com.deepseek.chat",
-    "ai.qwenlm.chat.android",
-    "com.copymanga.app",
-    "com.accuvally.hdtui",
-    "com.unnoo.quan",
-    "com.zb.sph.zaobaochina",
-    "com.zhuawa.filerecovery",
-    "net.huanci.hsj",
-    "net.huanci.hsjpro",
-    "net.lk.qingguo",
-    "com.mipay.wallet",
-    "com.xiaomi.shop",
-    "com.xiaomi.smarthome",
-    "com.mi.health",
-)
+DEFAULT_DOMESTIC_SCOPED_APPS: tuple[str, ...] = ()
 
 SYSTEM_NO_APPLIST_PKGS: tuple[str, ...] = (
     "com.xiaomi.market",
@@ -317,13 +221,56 @@ SECURITYCENTER_LOCKED_DBS: tuple[tuple[str, str, str], ...] = (
         "drop_app_predict",
     ),
 )
-SENSITIVE_BLUR_RE = re.compile(
-    "|".join(
-        [SENSITIVE_LOG_REGEX]
-        + [re.escape(p) for p in (*HMA_HIDE_ROOT_LIST, *HMA_HIDE_SENSITIVE_LIST)]
-    ),
-    re.IGNORECASE,
-)
+@dataclass(frozen=True)
+class HmaPolicy:
+    sensitive_log_regex: str
+    hide_root: tuple[str, ...]
+    hide_sensitive: tuple[str, ...]
+    domestic_scoped_apps: tuple[str, ...]
+    blur_re: re.Pattern[str]
+
+
+def build_hma_policy(
+    *,
+    sensitive_log_regex: str = DEFAULT_SENSITIVE_LOG_REGEX,
+    hide_root: tuple[str, ...] = DEFAULT_HMA_HIDE_ROOT_LIST,
+    hide_sensitive: tuple[str, ...] = DEFAULT_HMA_HIDE_SENSITIVE_LIST,
+    domestic_scoped_apps: tuple[str, ...] = DEFAULT_DOMESTIC_SCOPED_APPS,
+) -> HmaPolicy:
+    parts = [sensitive_log_regex] if sensitive_log_regex else []
+    parts.extend(re.escape(p) for p in (*hide_root, *hide_sensitive))
+    blur_re = re.compile("|".join(parts) if parts else r"$^", re.IGNORECASE)
+    return HmaPolicy(
+        sensitive_log_regex=sensitive_log_regex,
+        hide_root=hide_root,
+        hide_sensitive=hide_sensitive,
+        domestic_scoped_apps=domestic_scoped_apps,
+        blur_re=blur_re,
+    )
+
+
+DEFAULT_HMA_POLICY = build_hma_policy()
+
+
+def load_hma_policy(config_path: Path | None = None) -> HmaPolicy:
+    """Load HMA/log-scrubbing lists from --hma-config or DeviceManagement secret/android/hma-policy.json."""
+    target = config_path
+    if target is None:
+        candidate = Path(__file__).resolve().parents[2] / "secret" / "android" / "hma-policy.json"
+        if candidate.is_file():
+            target = candidate
+    if target is None:
+        return DEFAULT_HMA_POLICY
+
+    data = json.loads(target.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"HMA policy file {target} must be a JSON object")
+    return build_hma_policy(
+        sensitive_log_regex=str(data.get("sensitive_log_regex", DEFAULT_SENSITIVE_LOG_REGEX)),
+        hide_root=tuple(data.get("hide_root", DEFAULT_HMA_HIDE_ROOT_LIST)),
+        hide_sensitive=tuple(data.get("hide_sensitive", DEFAULT_HMA_HIDE_SENSITIVE_LIST)),
+        domestic_scoped_apps=tuple(data.get("domestic_scoped_apps", DEFAULT_DOMESTIC_SCOPED_APPS)),
+    )
 
 
 @dataclass(frozen=True)
@@ -384,7 +331,9 @@ def resolve_devices(serial: str | None, all_devices: bool) -> list[AdbDevice]:
     )
 
 
-def clean_remote_provider_xml(xml_text: str, whitelist_pkgs: list[str]) -> str:
+def clean_remote_provider_xml(
+    xml_text: str, whitelist_pkgs: list[str], policy: HmaPolicy = DEFAULT_HMA_POLICY
+) -> str:
     root = ET.fromstring(xml_text)
     for elem in list(root):
         name = elem.attrib.get("name", "")
@@ -409,7 +358,7 @@ def clean_remote_provider_xml(xml_text: str, whitelist_pkgs: list[str]) -> str:
                 cleaned_map = {
                     k: v
                     for k, v in mapping.items()
-                    if not SENSITIVE_BLUR_RE.search(k) and v != -1
+                    if not policy.blur_re.search(k) and v != -1
                 }
                 elem.text = json.dumps(cleaned_map, separators=(",", ":"))
             except json.JSONDecodeError:
@@ -499,7 +448,10 @@ def backup_device(dev: AdbDevice, backup_root: Path) -> Path:
 
 
 def apply_device(
-    dev: AdbDevice, backup_dir: Path | None, extra_whitelist: list[str]
+    dev: AdbDevice,
+    backup_dir: Path | None,
+    extra_whitelist: list[str],
+    policy: HmaPolicy = DEFAULT_HMA_POLICY,
 ) -> None:
     if not dev.has_root():
         raise RuntimeError(
@@ -597,7 +549,7 @@ def apply_device(
     dev.root_shell("am force-stop com.miui.securitycenter")
     rp_xml = dev.root_shell(f"cat {REMOTE_PROVIDER_PREFS_PATH}", check=False)
     if rp_xml.startswith("<?xml"):
-        cleaned = clean_remote_provider_xml(rp_xml, whitelist_pkgs)
+        cleaned = clean_remote_provider_xml(rp_xml, whitelist_pkgs, policy)
         proc = subprocess.run(
             [
                 "adb",
@@ -757,7 +709,7 @@ def apply_device(
         "  if [ -f \"$f\" ]; then sed -i '/install_app_string/d' \"$f\"; restorecon \"$f\" 2>/dev/null || true; fi; "
         "done; "
         f"for f in /data/system/pkg_history.txt /data/system/package-event/*; do "
-        f"  if [ -f \"$f\" ]; then {{ grep -viE '{SENSITIVE_LOG_REGEX}' \"$f\" > \"$f.tmp\" || true; }} && mv \"$f.tmp\" \"$f\" && chmod 600 \"$f\" && chown system:system \"$f\" && restorecon \"$f\" 2>/dev/null || true; fi; "
+        f"  if [ -f \"$f\" ]; then {{ grep -viE {shlex.quote(policy.sensitive_log_regex)} \"$f\" > \"$f.tmp\" || true; }} && mv \"$f.tmp\" \"$f\" && chmod 600 \"$f\" && chown system:system \"$f\" && restorecon \"$f\" 2>/dev/null || true; fi; "
         f"done"
     )
 
@@ -765,7 +717,7 @@ def apply_device(
     appops_cmds = [
         f"appops set --user 0 {pkg} 10022 ignore 2>/dev/null || true; "
         f"appops set --user 0 {pkg} GET_INSTALLED_APPS ignore 2>/dev/null || true"
-        for pkg in (*DOMESTIC_SCOPED_APPS, *SYSTEM_NO_APPLIST_PKGS)
+        for pkg in (*policy.domestic_scoped_apps, *SYSTEM_NO_APPLIST_PKGS)
     ]
     dev.root_shell("; ".join(appops_cmds))
 
@@ -785,10 +737,10 @@ def apply_device(
         cfg["forceMountData"] = True
         cfg["webViewProtection"] = True
         templates = cfg.setdefault("templates", {})
-        templates["hide root"] = {"isWhitelist": False, "appList": list(HMA_HIDE_ROOT_LIST)}
+        templates["hide root"] = {"isWhitelist": False, "appList": list(policy.hide_root)}
         templates["hide sensitive"] = {
             "isWhitelist": False,
-            "appList": list(HMA_HIDE_SENSITIVE_LIST),
+            "appList": list(policy.hide_sensitive),
         }
         scope = cfg.setdefault("scope", {})
         presets = [
@@ -800,7 +752,7 @@ def apply_device(
             "sus_apps",
             "xposed",
         ]
-        for pkg in DOMESTIC_SCOPED_APPS:
+        for pkg in policy.domestic_scoped_apps:
             if pkg in installed_3p or pkg in scope:
                 scope[pkg] = {
                     "useWhitelist": False,
@@ -842,7 +794,7 @@ def apply_device(
             )
 
 
-def check_device(dev: AdbDevice) -> bool:
+def check_device(dev: AdbDevice, policy: HmaPolicy = DEFAULT_HMA_POLICY) -> bool:
     model = dev.shell("getprop ro.product.model")
     codename = dev.shell("getprop ro.product.name")
     os_ver = dev.shell("getprop ro.build.version.incremental") or dev.shell(
@@ -992,7 +944,7 @@ def check_device(dev: AdbDevice) -> bool:
                 ),
                 "",
             )
-            blur_leaks = bool(SENSITIVE_BLUR_RE.search(blur_text))
+            blur_leaks = bool(policy.blur_re.search(blur_text))
             if (
                 guard_sup != "false"
                 or reject_keys
@@ -1133,7 +1085,7 @@ def check_device(dev: AdbDevice) -> bool:
             )
 
         sys_leaks = dev.root_shell(
-            f"grep -iE '{SENSITIVE_LOG_REGEX}' /data/system/pkg_history.txt /data/system/package-event/* 2>/dev/null | wc -l",
+            f"grep -iE {shlex.quote(policy.sensitive_log_regex)} /data/system/pkg_history.txt /data/system/package-event/* 2>/dev/null | wc -l",
             check=False,
         ).strip()
         if sys_leaks != "0":
@@ -1158,7 +1110,7 @@ def check_device(dev: AdbDevice) -> bool:
                 )
                 unscoped = [
                     pkg
-                    for pkg in DOMESTIC_SCOPED_APPS
+                    for pkg in policy.domestic_scoped_apps
                     if pkg in installed_3p and pkg not in scope
                 ]
                 if "hide root" not in tmpls or "hide sensitive" not in tmpls or unscoped:
@@ -1209,14 +1161,20 @@ def main() -> int:
         default=[],
         help="additional package name to add to SecurityCenter key_white_list_app",
     )
+    parser.add_argument(
+        "--hma-config",
+        type=Path,
+        help="JSON policy overriding HMA lists and log-scrub regex (defaults to ../../secret/android/hma-policy.json if present)",
+    )
     args = parser.parse_args()
 
+    policy = load_hma_policy(args.hma_config)
     devices = resolve_devices(args.serial, args.all)
     all_ok = True
     for dev in devices:
         if args.action == "apply":
-            apply_device(dev, args.backup_dir, args.whitelist)
-        ok = check_device(dev)
+            apply_device(dev, args.backup_dir, args.whitelist, policy)
+        ok = check_device(dev, policy)
         all_ok = all_ok and ok
     return 0 if all_ok else 1
 

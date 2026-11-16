@@ -1,0 +1,19 @@
+{
+  "sensitive_log_regex": "kernelsu|lsposed|hyperceiler|hma_oss|shizuku|follow\\.clash|bettbox",
+  "hide_root": [
+    "me.weishu.kernelsu",
+    "org.lsposed.manager",
+    "com.sevtinge.hyperceiler",
+    "org.frknkrc44.hma_oss",
+    "moe.shizuku.privileged.api",
+    "gr.nikolasspyr.integritycheck"
+  ],
+  "hide_sensitive": [
+    "com.follow.clash",
+    "com.appshub.bettbox"
+  ],
+  "domestic_scoped_apps": [
+    "com.example.banking",
+    "com.example.payment"
+  ]
+}
