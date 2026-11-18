@@ -146,6 +146,8 @@ Play Integrity 能否通过，同时依赖 **PIF 指纹/属性注入**、**安�
 
 - **HyperCeiler (`com.sevtinge.hyperceiler`)**：
   - MIUI / HyperOS 系统增强、广告与云控禁用、通知与控制中心优化、系统更新弹窗屏蔽。
+- **HyperPGuard (`io.github.vivibibi30.hyperpguard`)**：
+  - 按应用拦截部分数据采集、行为记录和上报。两台真机的作用域差异、已保存规则及恢复流程见 [HyperPGuard 配置](hyperpguard.md)。
 - **Hide Mock Location (`io.github.auag0.hidemocklocation`)**：
   - 模拟位置检测隐藏。
 - **HMA-OSS (`org.frknkrc44.hma_oss`)**：
